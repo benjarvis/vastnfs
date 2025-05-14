@@ -1,0 +1,1572 @@
+#!/bin/bash
+
+set +o posix
+set -eu
+set -o pipefail
+
+KMOD_SET=${KMOD_SET:-sunrpc|rpcgss|nfs|nfs4|rpcrdma}
+
+msg() {
+    echo "vastnfs-ctl:" $@
+}
+
+_bold() {
+    if [[ ${_cache__tput:-} == "" ]] ; then
+	if [[ $(which tput 2>/dev/null) != "" ]] ; then
+	    _cache__tput=1
+	    _cache_bold=$(tput bold)
+	    _cache_normal=$(tput sgr0)
+	else
+	    _cache__tput=0
+	    _cache_bold=""
+	    _cache_normal=""
+	fi
+    fi
+
+    echo -n ${_cache_bold}
+    "$@"
+    echo -n ${_cache_normal}
+}
+
+cmd_context=()
+
+_push() {
+    cmd_context+=($1)
+}
+
+show-cmd-context() {
+    if [[ ${#cmd_context[@]} != "0" ]] ; then
+	echo ${BASH_SOURCE} ${cmd_context[@]}
+    else
+	echo ${BASH_SOURCE}
+    fi
+}
+
+kmods() {
+    echo sunrpc
+    echo rpcrdma
+    echo compat_nfs_ssc
+    echo nfs_ssc
+    echo lockd
+    echo nfs_acl
+    echo auth_rpcgss
+    echo nfsd
+    echo rpcsec_gss_krb5
+    echo nfs
+    echo nfsv3
+    echo nfsv4
+}
+
+services() {
+    echo rpcbind.socket
+    echo rpcbind
+    echo rpc-gssd
+}
+
+systemctl-status() {
+    systemctl status $1 | grep Active: | awk '{print $2}'
+}
+
+probe-state() {
+    for mod in $(kmods) ; do
+	eval 'mod_'${mod}'=0'
+
+	if [[ -x /sys/module/${mod} ]] ; then
+	    eval 'mod_'${mod}'=1'
+	fi
+    done
+
+    for service in $(services) ; do
+	local service_var=$(echo ${service} | tr '.-' '__')
+	eval 'systemd_'${service_var}'=0'
+	if [[ "$(systemctl-status ${service})" == "active" ]] ; then
+	    eval 'systemd_'${service_var}'=1'
+	fi
+    done
+
+    rpc_pipefs=""
+    for path in /var/lib/nfs/rpc_pipefs /run/rpc_pipefs; do
+	if grep -q "${path} rpc_pipefs" /proc/mounts ; then
+	    rpc_pipefs=${path}
+	    break
+	fi
+    done
+
+    nfs_bundle_git_version=""
+    nfs_bundle_version=""
+    if [[ -e /sys/module/sunrpc/parameters/nfs_bundle_version ]] ; then
+	nfs_bundle_version=$(cat /sys/module/sunrpc/parameters/nfs_bundle_version)
+    elif [[ -e /sys/module/sunrpc/parameters/nfs_bundle_git_version ]] ; then
+	nfs_bundle_git_version=$(cat /sys/module/sunrpc/parameters/nfs_bundle_git_version)
+    fi
+
+    nfs_bundle_base_git_version=""
+    if [[ -e /sys/module/sunrpc/parameters/nfs_bundle_base_git_version ]] ; then
+	nfs_bundle_base_git_version=$(cat /sys/module/sunrpc/parameters/nfs_bundle_base_git_version)
+    fi
+}
+
+unload() {
+    umount -a -t nfs
+    umount -a -t nfs4
+
+    for service in $(services | tac) ; do
+	local service_var=$(echo ${service} | tr '.-' '__')
+	if [[ "${service}" == "rpcbind" ]] ; then
+	    # Skip stopping rpcbind if rpcbind.socket exists
+	    if [[ "${systemd_rpcbind_socket}" == "1" ]] ; then
+		continue;
+	    fi
+	fi
+
+	if [[ "$(eval 'echo $systemd_'$service_var)" == "1" ]] ; then
+	    msg "stopping service ${service}"
+	    systemctl stop ${service}
+	fi
+    done
+
+    if [[ "${rpc_pipefs}" != "" ]] ; then
+	msg "umounting fs ${rpc_pipefs}"
+	umount ${rpc_pipefs}
+    fi
+
+    for mod in $(kmods | tac); do
+	if [[ "$(eval 'echo $mod_'$mod)" == "1" ]] ; then
+	    if [[ "${mod}" == "sunrpc" ]] ; then
+		# This is to deal with some bugs un sunrpc exit function
+		echo 2 > /proc/sys/vm/drop_caches
+		sleep 1
+	    fi
+
+	    msg "unloading kmod ${mod}"
+	    rmmod ${mod}
+	fi
+    done
+}
+
+restore-state() {
+    for mod in $(kmods); do
+	if [[ "$(eval 'echo $mod_'$mod)" == "1" ]] ; then
+	    msg "loading kmod ${mod}"
+	    modprobe ${mod}
+	fi
+    done
+
+    if [[ "${rpc_pipefs}" != "" ]] ; then
+	msg "mounting fs ${rpc_pipefs}"
+	mount -t rpc_pipefs sunrpc ${rpc_pipefs}
+    fi
+
+    for service in $(services) ; do
+	local service_var=$(echo ${service} | tr '.-' '__')
+	if [[ "$(eval 'echo $systemd_'$service_var)" == "1" ]] ; then
+	    msg "starting service ${service}"
+	    systemctl start ${service}
+	fi
+    done
+}
+
+vastnfs-reload() {
+    if [[ "$(id -u)" != "0" ]] ; then
+	echo "vastnfs-ctl: reload must run as root"
+	exit -1
+    fi
+
+    probe-state
+    unload
+    restore-state
+}
+
+vastnfs-status() {
+    probe-state
+
+    if [[ "${nfs_bundle_git_version}" == "" ]] && [[ "${nfs_bundle_version}" == "" ]] ; then
+	echo "patched version not running"
+    elif [[ "${nfs_bundle_git_version}" != "" ]] ; then
+	echo "version: ${nfs_bundle_git_version}"
+	if [[ "${nfs_bundle_git_version}" != "${nfs_bundle_base_git_version}" ]] ; then
+	    echo "build-version: ${nfs_bundle_base_git_version}"
+	fi
+    else
+	echo "version: ${nfs_bundle_version}"
+    fi
+
+    local mods=""
+    for mod in $(kmods) ; do
+	if [[ "$(eval 'echo $mod_'$mod)" == "1" ]] ; then
+	    mods="${mods} ${mod}"
+	fi
+    done
+
+    if [[ "${mods}" == "" ]] ; then
+	echo "kernel modules: <none>"
+	return
+    else
+	echo "kernel modules:${mods}"
+    fi
+
+    local services=""
+    for service in $(services) ; do
+	local service_var=$(echo ${service} | tr '.-' '__')
+	if [[ "$(eval 'echo $systemd_'$service_var)" == "1" ]] ; then
+	    services="${services} ${service}"
+	fi
+    done
+
+    if [[ "${services}" != "" ]] ; then
+	echo "services:${services}"
+    fi
+
+    if [[ "$rpc_pipefs" != "" ]] ; then
+	echo "rpc_pipefs: ${rpc_pipefs}"
+    fi
+}
+
+classified-tracepoints() {
+    echo IO     GOOD      nfs:nfs_access_enter
+    echo IO     GOOD      nfs:nfs_access_exit
+    echo IO     GOOD      nfs:nfs_atomic_open_enter
+    echo IO     GOOD      nfs:nfs_atomic_open_exit
+    echo IO     GOOD      nfs:nfs_commit_done
+    echo IO     EH        nfs:nfs_commit_error
+    echo IO     EH        nfs:nfs_comp_error
+    echo IO     GOOD      nfs:nfs_create_enter
+    echo IO     GOOD      nfs:nfs_create_exit
+    echo IO     GOOD      nfs:nfs_fh_to_dentry
+    echo IO     GOOD      nfs:nfs_fsync_enter
+    echo IO     GOOD      nfs:nfs_fsync_exit
+    echo IO     GOOD      nfs:nfs_getattr_enter
+    echo IO     GOOD      nfs:nfs_getattr_exit
+    echo IO     GOOD      nfs:nfs_initiate_commit
+    echo IO     GOOD      nfs:nfs_initiate_read
+    echo IO     GOOD      nfs:nfs_initiate_write
+    echo IO     GOOD      nfs:nfs_invalidate_mapping_enter
+    echo IO     GOOD      nfs:nfs_invalidate_mapping_exit
+    echo IO     GOOD      nfs:nfs_link_enter
+    echo IO     GOOD      nfs:nfs_link_exit
+    echo IO     GOOD      nfs:nfs_lookup_enter
+    echo IO     GOOD      nfs:nfs_lookup_exit
+    echo IO     GOOD      nfs:nfs_lookup_revalidate_enter
+    echo IO     GOOD      nfs:nfs_lookup_revalidate_exit
+    echo IO     GOOD      nfs:nfs_mkdir_enter
+    echo IO     GOOD      nfs:nfs_mkdir_exit
+    echo IO     GOOD      nfs:nfs_mknod_enter
+    echo IO     GOOD      nfs:nfs_mknod_exit
+    echo IO     EH        nfs:nfs_pgio_error
+    echo IO     GOOD      nfs:nfs_inode_bind_server_idx
+    echo IO     GOOD      nfs:nfs_readpage_done
+    echo IO     GOOD      nfs:nfs_readpage_short
+    echo IO     GOOD      nfs:nfs_refresh_inode_enter
+    echo IO     GOOD      nfs:nfs_refresh_inode_exit
+    echo IO     GOOD      nfs:nfs_remove_enter
+    echo IO     GOOD      nfs:nfs_remove_exit
+    echo IO     GOOD      nfs:nfs_rename_enter
+    echo IO     GOOD      nfs:nfs_rename_exit
+    echo IO     GOOD      nfs:nfs_revalidate_inode_enter
+    echo IO     GOOD      nfs:nfs_revalidate_inode_exit
+    echo IO     GOOD      nfs:nfs_rmdir_enter
+    echo IO     GOOD      nfs:nfs_rmdir_exit
+    echo IO     GOOD      nfs:nfs_set_inode_stale
+    echo IO     GOOD      nfs:nfs_setattr_enter
+    echo IO     GOOD      nfs:nfs_setattr_exit
+    echo IO     GOOD      nfs:nfs_sillyrename_rename
+    echo IO     GOOD      nfs:nfs_sillyrename_unlink
+    echo IO     GOOD      nfs:nfs_symlink_enter
+    echo IO     GOOD      nfs:nfs_symlink_exit
+    echo IO     GOOD      nfs:nfs_symlink_stale_enter
+    echo IO     GOOD      nfs:nfs_symlink_stale_exit
+    echo IO     GOOD      nfs:nfs_symlink_stale_lookup_enter
+    echo IO     GOOD      nfs:nfs_symlink_stale_lookup_exit
+    echo IO     GOOD      nfs:nfs_unlink_enter
+    echo IO     GOOD      nfs:nfs_unlink_exit
+    echo IO     GOOD      nfs:nfs_write_error
+    echo IO     GOOD      nfs:nfs_write_internal_buffer
+    echo IO     GOOD      nfs:nfs_writeback_done
+    echo IO     GOOD      nfs:nfs_writeback_inode_enter
+    echo IO     GOOD      nfs:nfs_writeback_inode_exit
+    echo IO     GOOD      nfs:nfs_writeback_page_enter
+    echo IO     GOOD      nfs:nfs_writeback_page_exit
+    echo IO     GOOD      nfs:nfs_optlockflush_zap_avoided
+    echo IO     GOOD      nfs:nfs_xdr_bad_filehandle
+    echo IO     GOOD      nfs:nfs_xdr_status
+    echo IO     EH        rpcrdma:svcrdma_accept_err
+    echo IO     EH        rpcrdma:svcrdma_decode_badproc_err
+    echo IO     EH        rpcrdma:svcrdma_decode_badvers_err
+    echo IO     EH        rpcrdma:svcrdma_decode_drop_err
+    echo IO     EH        rpcrdma:svcrdma_decode_parse_err
+    echo IO     GOOD      rpcrdma:svcrdma_decode_rqst
+    echo IO     GOOD      rpcrdma:svcrdma_decode_rseg
+    echo IO     EH        rpcrdma:svcrdma_decode_short_err
+    echo IO     GOOD      rpcrdma:svcrdma_decode_wseg
+    echo IO     EH        rpcrdma:svcrdma_dma_map_err
+    echo IO     GOOD      rpcrdma:svcrdma_dma_map_page
+    echo IO     EH        rpcrdma:svcrdma_dma_map_rw_err
+    echo IO     GOOD      rpcrdma:svcrdma_dma_unmap_page
+    echo IO     GOOD      rpcrdma:svcrdma_encode_wseg
+    echo IO     EH        rpcrdma:svcrdma_err_chunk
+    echo IO     EH        rpcrdma:svcrdma_err_vers
+    echo IO     EH        rpcrdma:svcrdma_fabric_err
+    echo IO     EH        rpcrdma:svcrdma_initdepth_err
+    echo IO     EH        rpcrdma:svcrdma_no_rwctx_err
+    echo IO     EH        rpcrdma:svcrdma_page_overrun_err
+    echo IO     EH        rpcrdma:svcrdma_pd_err
+    echo IO     GOOD      rpcrdma:svcrdma_post_read_chunk
+    echo IO     GOOD      rpcrdma:svcrdma_post_recv
+    echo IO     GOOD      rpcrdma:svcrdma_post_reply_chunk
+    echo IO     GOOD      rpcrdma:svcrdma_post_send
+    echo IO     GOOD      rpcrdma:svcrdma_post_write_chunk
+    echo IO     EH        rpcrdma:svcrdma_qp_err
+    echo IO     EH        rpcrdma:svcrdma_qp_error
+    echo IO     EH        rpcrdma:svcrdma_rq_post_err
+    echo IO     EH        rpcrdma:svcrdma_send_err
+    echo IO     GOOD      rpcrdma:svcrdma_send_pullup
+    echo IO     EH        rpcrdma:svcrdma_small_wrch_err
+    echo IO     GOOD      rpcrdma:svcrdma_sq_full
+    echo IO     EH        rpcrdma:svcrdma_sq_post_err
+    echo IO     GOOD      rpcrdma:svcrdma_sq_retry
+    echo IO     GOOD      rpcrdma:svcrdma_wc_read
+    echo IO     GOOD      rpcrdma:svcrdma_wc_receive
+    echo IO     GOOD      rpcrdma:svcrdma_wc_send
+    echo IO     GOOD      rpcrdma:svcrdma_wc_write
+    echo IO     GOOD      rpcrdma:xprtrdma_cb_call
+    echo IO     GOOD      rpcrdma:xprtrdma_cb_reply
+    echo IO     GOOD      rpcrdma:xprtrdma_cb_setup
+    echo IO     GOOD      rpcrdma:xprtrdma_chunk_read
+    echo IO     GOOD      rpcrdma:xprtrdma_chunk_reply
+    echo IO     GOOD      rpcrdma:xprtrdma_chunk_write
+    echo META   GOOD      rpcrdma:xprtrdma_connect
+    echo META   EH        rpcrdma:xprtrdma_connect_err
+    echo IO     GOOD      rpcrdma:xprtrdma_createmrs
+    echo IO     GOOD      rpcrdma:xprtrdma_decode_seg
+    echo META   GOOD      rpcrdma:xprtrdma_disconnect
+    echo IO     EH        rpcrdma:xprtrdma_dma_maperr
+    echo IO     EH        rpcrdma:xprtrdma_err_chunk
+    echo IO     EH        rpcrdma:xprtrdma_err_unrecognized
+    echo IO     EH        rpcrdma:xprtrdma_err_vers
+    echo IO     GOOD      rpcrdma:xprtrdma_fixup
+    echo IO     GOOD      rpcrdma:xprtrdma_frwr_alloc
+    echo IO     GOOD      rpcrdma:xprtrdma_frwr_dereg
+    echo IO     EH        rpcrdma:xprtrdma_frwr_maperr
+    echo IO     EH        rpcrdma:xprtrdma_frwr_sgerr
+    echo IO     GOOD      rpcrdma:xprtrdma_inline_thresh
+    echo IO     GOOD      rpcrdma:xprtrdma_marshal
+    echo IO     GOOD      rpcrdma:xprtrdma_marshal_failed
+    echo IO     GOOD      rpcrdma:xprtrdma_mr_fastreg
+    echo IO     GOOD      rpcrdma:xprtrdma_mr_localinv
+    echo IO     GOOD      rpcrdma:xprtrdma_mr_map
+    echo IO     GOOD      rpcrdma:xprtrdma_mr_reminv
+    echo IO     GOOD      rpcrdma:xprtrdma_mr_unmap
+    echo IO     GOOD      rpcrdma:xprtrdma_mrs_zap
+    echo IO     EH        rpcrdma:xprtrdma_nomrs_err
+    echo META   GOOD      rpcrdma:xprtrdma_op_connect
+    echo META   GOOD      rpcrdma:xprtrdma_op_inject_dsc
+    echo META   GOOD      rpcrdma:xprtrdma_op_set_cto
+    echo IO     EH        rpcrdma:xprtrdma_post_linv_err
+    echo IO     GOOD      rpcrdma:xprtrdma_post_recv
+    echo IO     GOOD      rpcrdma:xprtrdma_post_recvs
+    echo IO     EH        rpcrdma:xprtrdma_post_recvs_err
+    echo IO     GOOD      rpcrdma:xprtrdma_post_send
+    echo IO     EH        rpcrdma:xprtrdma_post_send_err
+    echo IO     GOOD      rpcrdma:xprtrdma_prepsend_failed
+    echo IO     GOOD      rpcrdma:xprtrdma_reply
+    echo IO     EH        rpcrdma:xprtrdma_reply_hdr_err
+    echo IO     EH        rpcrdma:xprtrdma_reply_rqst_err
+    echo IO     EH        rpcrdma:xprtrdma_reply_short_err
+    echo IO     EH        rpcrdma:xprtrdma_reply_vers_err
+    echo IO     GOOD      rpcrdma:xprtrdma_wc_fastreg
+    echo IO     GOOD      rpcrdma:xprtrdma_wc_li
+    echo IO     GOOD      rpcrdma:xprtrdma_wc_li_done
+    echo IO     GOOD      rpcrdma:xprtrdma_wc_li_wake
+    echo IO     GOOD      rpcrdma:xprtrdma_wc_receive
+    echo IO     GOOD      rpcrdma:xprtrdma_wc_send
+    echo IO     GOOD      sunrpc:cache_entry_expired
+    echo IO     GOOD      sunrpc:cache_entry_make_negative
+    echo IO     GOOD      sunrpc:cache_entry_no_listener
+    echo IO     GOOD      sunrpc:cache_entry_upcall
+    echo IO     GOOD      sunrpc:cache_entry_update
+    echo META   GOOD      sunrpc:pmap_register
+    echo IO     EH        sunrpc:rpc__auth_tooweak
+    echo IO     EH        sunrpc:rpc__bad_creds
+    echo IO     EH        sunrpc:rpc__garbage_args
+    echo IO     EH        sunrpc:rpc__mismatch
+    echo IO     EH        sunrpc:rpc__proc_unavail
+    echo IO     EH        sunrpc:rpc__prog_mismatch
+    echo IO     EH        sunrpc:rpc__prog_unavail
+    echo IO     EH        sunrpc:rpc__stale_creds
+    echo IO     EH        sunrpc:rpc__unparsable
+    echo IO     EH        sunrpc:rpc_bad_callhdr
+    echo IO     EH        sunrpc:rpc_bad_verifier
+    echo IO     GOOD      sunrpc:rpc_buf_alloc
+    echo IO     EH        sunrpc:rpc_call_rpcerror
+    echo IO     GOOD      sunrpc:rpc_call_status
+    echo META   EH        sunrpc:rpc_clnt_clone_err
+    echo META   GOOD      sunrpc:rpc_clnt_free
+    echo META   EH        sunrpc:rpc_clnt_killall
+    echo META   GOOD      sunrpc:rpc_clnt_new
+    echo META   EH        sunrpc:rpc_clnt_new_err
+    echo META   GOOD      sunrpc:rpc_clnt_release
+    echo META   GOOD      sunrpc:rpc_clnt_replace_xprt
+    echo META   EH        sunrpc:rpc_clnt_replace_xprt_err
+    echo META   GOOD      sunrpc:rpc_clnt_shutdown
+    echo IO     EH        sunrpc:rpc_connect_status
+    echo IO     GOOD      sunrpc:rpc_refresh_status
+    echo IO     GOOD      sunrpc:rpc_request
+    echo IO     EH        sunrpc:rpc_retry_refresh_status
+    echo IO     GOOD      sunrpc:rpc_route_request
+    echo IO     GOOD      sunrpc:rpc_route_start
+    echo IO     GOOD      sunrpc:rpc_route_verdict
+    echo META   GOOD      sunrpc:rpc_socket_close
+    echo META   GOOD      sunrpc:rpc_socket_connect
+    echo IO     EH        sunrpc:rpc_socket_error
+    echo IO     GOOD      sunrpc:rpc_socket_nospace
+    echo META   GOOD      sunrpc:rpc_socket_reset_connection
+    echo META   GOOD      sunrpc:rpc_socket_shutdown
+    echo META   GOOD      sunrpc:rpc_socket_state_change
+    echo IO     GOOD      sunrpc:rpc_stats_latency
+    echo IO     GOOD      sunrpc:rpc_task_begin
+    echo IO     GOOD      sunrpc:rpc_task_complete
+    echo IO     GOOD      sunrpc:rpc_task_end
+    echo IO     GOOD      sunrpc:rpc_task_free
+    echo IO     GOOD      sunrpc:rpc_task_run_action
+    echo META   GOOD      sunrpc:rpc_task_signalled
+    echo IO     GOOD      sunrpc:rpc_task_sleep
+    echo IO     GOOD      sunrpc:rpc_task_sync_sleep
+    echo IO     GOOD      sunrpc:rpc_task_sync_wake
+    echo IO     EH        sunrpc:rpc_task_timeout
+    echo IO     GOOD      sunrpc:rpc_task_wakeup
+    echo IO     EH        sunrpc:rpc_timeout_status
+    echo IO     GOOD      sunrpc:rpc_xdr_alignment
+    echo IO     EH        sunrpc:rpc_xdr_overflow
+    echo IO     GOOD      sunrpc:rpc_xdr_recvfrom
+    echo IO     GOOD      sunrpc:rpc_xdr_reply_pages
+    echo IO     GOOD      sunrpc:rpc_xdr_sendto
+    echo META   EH        sunrpc:rpcb_bind_version_err
+    echo META   GOOD      sunrpc:rpcb_getport
+    echo META   EH        sunrpc:rpcb_prog_unavail_err
+    echo META   GOOD      sunrpc:rpcb_register
+    echo META   GOOD      sunrpc:rpcb_setport
+    echo META   EH        sunrpc:rpcb_timeout_err
+    echo META   EH        sunrpc:rpcb_unreachable_err
+    echo META   EH        sunrpc:rpcb_unrecognized_err
+    echo META   GOOD      sunrpc:rpcb_unregister
+    echo IO     GOOD      sunrpc:svc_authenticate
+    echo IO     GOOD      sunrpc:svc_defer
+    echo IO     GOOD      sunrpc:svc_defer_drop
+    echo IO     GOOD      sunrpc:svc_defer_queue
+    echo IO     GOOD      sunrpc:svc_defer_recv
+    echo IO     GOOD      sunrpc:svc_drop
+    echo IO     GOOD      sunrpc:svc_handle_xprt
+    echo IO     GOOD      sunrpc:svc_noregister
+    echo IO     GOOD      sunrpc:svc_process
+    echo META   GOOD      sunrpc:svc_register
+    echo IO     GOOD      sunrpc:svc_send
+    echo IO     GOOD      sunrpc:svc_stats_latency
+    echo META   GOOD      sunrpc:svc_unregister
+    echo IO     GOOD      sunrpc:svc_wake_up
+    echo IO     GOOD      sunrpc:svc_xdr_recvfrom
+    echo IO     GOOD      sunrpc:svc_xdr_sendto
+    echo META   GOOD      sunrpc:svc_xprt_accept
+    echo META   GOOD      sunrpc:svc_xprt_close
+    echo IO     EH        sunrpc:svc_xprt_create_err
+    echo IO     GOOD      sunrpc:svc_xprt_dequeue
+    echo IO     GOOD      sunrpc:svc_xprt_detach
+    echo IO     GOOD      sunrpc:svc_xprt_do_enqueue
+    echo META   GOOD      sunrpc:svc_xprt_free
+    echo IO     GOOD      sunrpc:svc_xprt_no_write_space
+    echo IO     GOOD      sunrpc:svc_xprt_received
+    echo IO     EH        sunrpc:svcsock_accept_err
+    echo IO     GOOD      sunrpc:svcsock_data_ready
+    echo IO     EH        sunrpc:svcsock_getpeername_err
+    echo IO     GOOD      sunrpc:svcsock_marker
+    echo META   GOOD      sunrpc:svcsock_new_socket
+    echo IO     GOOD      sunrpc:svcsock_tcp_recv
+    echo IO     GOOD      sunrpc:svcsock_tcp_recv_eagain
+    echo IO     EH        sunrpc:svcsock_tcp_recv_err
+    echo IO     GOOD      sunrpc:svcsock_tcp_recv_short
+    echo IO     GOOD      sunrpc:svcsock_tcp_send
+    echo IO     GOOD      sunrpc:svcsock_tcp_state
+    echo IO     GOOD      sunrpc:svcsock_udp_recv
+    echo IO     EH        sunrpc:svcsock_udp_recv_err
+    echo IO     GOOD      sunrpc:svcsock_udp_send
+    echo IO     GOOD      sunrpc:svcsock_write_space
+    echo META   GOOD      sunrpc:xprt_connect
+    echo META   GOOD      sunrpc:xprt_create
+    echo META   GOOD      sunrpc:xprt_destroy
+    echo META   GOOD      sunrpc:xprt_disconnect_auto
+    echo META   GOOD      sunrpc:xprt_disconnect_cleanup
+    echo META   GOOD      sunrpc:xprt_disconnect_done
+    echo META   GOOD      sunrpc:xprt_disconnect_force
+    echo IO     GOOD      sunrpc:xprt_get_cong
+    echo IO     GOOD      sunrpc:xprt_lookup_rqst
+    echo IO     GOOD      sunrpc:xprt_ping
+    echo IO     GOOD      sunrpc:xprt_put_cong
+    echo IO     GOOD      sunrpc:xprt_release_cong
+    echo IO     GOOD      sunrpc:xprt_release_xprt
+    echo IO     GOOD      sunrpc:xprt_reserve
+    echo IO     GOOD      sunrpc:xprt_reserve_cong
+    echo IO     GOOD      sunrpc:xprt_reserve_xprt
+    echo IO     EH        sunrpc:xprt_retransmit
+    echo IO     EH        sunrpc:xprt_timer
+    echo IO     GOOD      sunrpc:xprt_transmit
+    echo IO     GOOD      sunrpc:xs_stream_read_data
+    echo IO     GOOD      sunrpc:xs_stream_read_request
+    echo IO     GOOD      nfs4:nfs4_setclientid
+    echo IO     GOOD      nfs4:nfs4_setclientid_confirm
+    echo IO     GOOD      nfs4:nfs4_renew
+    echo IO     GOOD      nfs4:nfs4_renew_async
+    echo IO     GOOD      nfs4:nfs4_exchange_id
+    echo META   GOOD      nfs4:nfs4_create_session
+    echo META   GOOD      nfs4:nfs4_destroy_session
+    echo META   GOOD      nfs4:nfs4_destroy_clientid
+    echo META   GOOD      nfs4:nfs4_bind_conn_to_session
+    echo IO     GOOD      nfs4:nfs4_sequence
+    echo IO     GOOD      nfs4:nfs4_reclaim_complete
+    echo IO     GOOD      nfs4:nfs4_sequence_done
+    echo IO     GOOD      nfs4:nfs4_cb_sequence
+    echo IO     EH        nfs4:nfs4_cb_seqid_err
+    echo IO     GOOD      nfs4:nfs4_setup_sequence
+    echo META   GOOD      nfs4:nfs4_state_mgr
+    echo META   GOOD      nfs4:nfs4_state_mgr_failed
+    echo IO     GOOD      nfs4:nfs4_xdr_bad_operation
+    echo IO     GOOD      nfs4:nfs4_xdr_status
+    echo IO     GOOD      nfs4:nfs4_xdr_bad_filehandle
+    echo IO     GOOD      nfs4:nfs_cb_no_clp
+    echo IO     GOOD      nfs4:nfs_cb_badprinc
+    echo IO     GOOD      nfs4:nfs4_open_reclaim
+    echo IO     GOOD      nfs4:nfs4_open_expired
+    echo IO     GOOD      nfs4:nfs4_open_file
+    echo IO     GOOD      nfs4:nfs4_cached_open
+    echo IO     GOOD      nfs4:nfs4_close
+    echo IO     GOOD      nfs4:nfs4_get_lock
+    echo IO     GOOD      nfs4:nfs4_unlock
+    echo IO     GOOD      nfs4:nfs4_set_lock
+    echo IO     GOOD      nfs4:nfs4_state_lock_reclaim
+    echo IO     GOOD      nfs4:nfs4_set_delegation
+    echo IO     GOOD      nfs4:nfs4_reclaim_delegation
+    echo IO     GOOD      nfs4:nfs4_delegreturn_exit
+    echo IO     GOOD      nfs4:nfs4_test_delegation_stateid
+    echo IO     GOOD      nfs4:nfs4_test_open_stateid
+    echo IO     GOOD      nfs4:nfs4_test_lock_stateid
+    echo IO     GOOD      nfs4:nfs4_lookup
+    echo IO     GOOD      nfs4:nfs4_symlink
+    echo IO     GOOD      nfs4:nfs4_mkdir
+    echo IO     GOOD      nfs4:nfs4_mknod
+    echo IO     GOOD      nfs4:nfs4_remove
+    echo IO     GOOD      nfs4:nfs4_get_fs_locations
+    echo IO     GOOD      nfs4:nfs4_secinfo
+    echo IO     GOOD      nfs4:nfs4_lookupp
+    echo IO     GOOD      nfs4:nfs4_rename
+    echo IO     GOOD      nfs4:nfs4_access
+    echo IO     GOOD      nfs4:nfs4_readlink
+    echo IO     GOOD      nfs4:nfs4_readdir
+    echo IO     GOOD      nfs4:nfs4_get_acl
+    echo IO     GOOD      nfs4:nfs4_set_acl
+    echo IO     GOOD      nfs4:nfs4_get_security_label
+    echo IO     GOOD      nfs4:nfs4_set_security_label
+    echo IO     GOOD      nfs4:nfs4_setattr
+    echo IO     GOOD      nfs4:nfs4_delegreturn
+    echo IO     GOOD      nfs4:nfs4_open_stateid_update
+    echo IO     GOOD      nfs4:nfs4_open_stateid_update_wait
+    echo IO     GOOD      nfs4:nfs4_close_stateid_update_wait
+    echo IO     GOOD      nfs4:nfs4_server_bind_nfs_client
+    echo IO     GOOD      nfs4:nfs4_getattr
+    echo IO     GOOD      nfs4:nfs4_lookup_root
+    echo IO     GOOD      nfs4:nfs4_fsinfo
+    echo IO     GOOD      nfs4:nfs4_cb_getattr
+    echo IO     GOOD      nfs4:nfs4_cb_recall
+    echo IO     GOOD      nfs4:nfs4_cb_layoutrecall_file
+    echo IO     GOOD      nfs4:nfs4_map_name_to_uid
+    echo IO     GOOD      nfs4:nfs4_map_group_to_gid
+    echo IO     GOOD      nfs4:nfs4_map_uid_to_name
+    echo IO     GOOD      nfs4:nfs4_map_gid_to_group
+    echo IO     GOOD      nfs4:nfs4_read
+    echo IO     GOOD      nfs4:nfs4_pnfs_read
+    echo IO     GOOD      nfs4:nfs4_write
+    echo IO     GOOD      nfs4:nfs4_pnfs_write
+    echo IO     GOOD      nfs4:nfs4_commit
+    echo IO     GOOD      nfs4:nfs4_pnfs_commit_ds
+    echo IO     GOOD      nfs4:nfs4_layoutget
+    echo IO     GOOD      nfs4:nfs4_layoutcommit
+    echo IO     GOOD      nfs4:nfs4_layoutreturn
+    echo IO     GOOD      nfs4:nfs4_layoutreturn_on_close
+    echo IO     EH        nfs4:nfs4_layouterror
+    echo IO     GOOD      nfs4:nfs4_layoutstats
+    echo IO     GOOD      nfs4:pnfs_update_layout
+    echo IO     GOOD      nfs4:pnfs_mds_fallback_pg_init_read
+    echo IO     GOOD      nfs4:pnfs_mds_fallback_pg_init_write
+    echo IO     GOOD      nfs4:pnfs_mds_fallback_pg_get_mirror_count
+    echo IO     GOOD      nfs4:pnfs_mds_fallback_read_done
+    echo IO     GOOD      nfs4:pnfs_mds_fallback_write_done
+    echo IO     GOOD      nfs4:pnfs_mds_fallback_read_pagelist
+    echo IO     GOOD      nfs4:pnfs_mds_fallback_write_pagelist
+    echo META   GOOD      nfs4:nfs4_deviceid_free
+    echo IO     GOOD      nfs4:nfs4_getdeviceinfo
+    echo IO     GOOD      nfs4:nfs4_find_deviceid
+    echo IO     EH        nfs4:ff_layout_read_error
+    echo IO     EH        nfs4:ff_layout_write_error
+    echo IO     EH        nfs4:ff_layout_commit_error
+    echo IO     GOOD      nfs4:nfs4_encode_read_request
+    echo IO     GOOD      nfs4:nfs4_decode_read_response
+    echo IO     GOOD      nfs4:nfs4_encode_write_request
+    echo IO     GOOD      nfs4:nfs4_decode_write_response
+    echo IO     GOOD      nfs4:nfs4_encode_commit_request
+    echo IO     GOOD      nfs4:nfs4_decode_commit_response
+    echo IO     GOOD      nfs4:nfs4_encode_open_request
+    echo IO     GOOD      nfs4:nfs4_decode_open_response
+    echo IO     GOOD      nfs4:nfs4_encode_open_confirm_request
+    echo IO     GOOD      nfs4:nfs4_decode_open_confirm_response
+    echo IO     GOOD      nfs4:nfs4_encode_open_noattr_request
+    echo IO     GOOD      nfs4:nfs4_decode_open_noattr_response
+    echo IO     GOOD      nfs4:nfs4_encode_open_downgrade_request
+    echo IO     GOOD      nfs4:nfs4_decode_open_downgrade_response
+    echo IO     GOOD      nfs4:nfs4_encode_close_request
+    echo IO     GOOD      nfs4:nfs4_decode_close_response
+    echo IO     GOOD      nfs4:nfs4_encode_setattr_request
+    echo IO     GOOD      nfs4:nfs4_decode_setattr_response
+    echo IO     GOOD      nfs4:nfs4_encode_fsinfo_request
+    echo IO     GOOD      nfs4:nfs4_decode_fsinfo_response
+    echo IO     GOOD      nfs4:nfs4_encode_renew_request
+    echo IO     GOOD      nfs4:nfs4_decode_renew_response
+    echo IO     GOOD      nfs4:nfs4_encode_setclientid_request
+    echo IO     GOOD      nfs4:nfs4_decode_setclientid_response
+    echo IO     GOOD      nfs4:nfs4_encode_setclientid_confirm_request
+    echo IO     GOOD      nfs4:nfs4_decode_setclientid_confirm_response
+    echo IO     GOOD      nfs4:nfs4_encode_lock_request
+    echo IO     GOOD      nfs4:nfs4_decode_lock_response
+    echo IO     GOOD      nfs4:nfs4_encode_lockt_request
+    echo IO     GOOD      nfs4:nfs4_decode_lockt_response
+    echo IO     GOOD      nfs4:nfs4_encode_locku_request
+    echo IO     GOOD      nfs4:nfs4_decode_locku_response
+    echo IO     GOOD      nfs4:nfs4_encode_access_request
+    echo IO     GOOD      nfs4:nfs4_decode_access_response
+    echo IO     GOOD      nfs4:nfs4_encode_getattr_request
+    echo IO     GOOD      nfs4:nfs4_decode_getattr_response
+    echo IO     GOOD      nfs4:nfs4_encode_lookup_request
+    echo IO     GOOD      nfs4:nfs4_decode_lookup_response
+    echo IO     GOOD      nfs4:nfs4_encode_lookup_root_request
+    echo IO     GOOD      nfs4:nfs4_decode_lookup_root_response
+    echo IO     GOOD      nfs4:nfs4_encode_remove_request
+    echo IO     GOOD      nfs4:nfs4_decode_remove_response
+    echo IO     GOOD      nfs4:nfs4_encode_rename_request
+    echo IO     GOOD      nfs4:nfs4_decode_rename_response
+    echo IO     GOOD      nfs4:nfs4_encode_link_request
+    echo IO     GOOD      nfs4:nfs4_decode_link_response
+    echo IO     GOOD      nfs4:nfs4_encode_symlink_request
+    echo IO     GOOD      nfs4:nfs4_decode_symlink_response
+    echo IO     GOOD      nfs4:nfs4_encode_create_request
+    echo IO     GOOD      nfs4:nfs4_decode_create_response
+    echo IO     GOOD      nfs4:nfs4_encode_pathconf_request
+    echo IO     GOOD      nfs4:nfs4_decode_pathconf_response
+    echo IO     GOOD      nfs4:nfs4_encode_statfs_request
+    echo IO     GOOD      nfs4:nfs4_decode_statfs_response
+    echo IO     GOOD      nfs4:nfs4_encode_readlink_request
+    echo IO     GOOD      nfs4:nfs4_decode_readlink_response
+    echo IO     GOOD      nfs4:nfs4_encode_readdir_request
+    echo IO     GOOD      nfs4:nfs4_decode_readdir_response
+    echo IO     GOOD      nfs4:nfs4_encode_server_caps_request
+    echo IO     GOOD      nfs4:nfs4_decode_server_caps_response
+    echo IO     GOOD      nfs4:nfs4_encode_delegreturn_request
+    echo IO     GOOD      nfs4:nfs4_decode_delegreturn_response
+    echo IO     GOOD      nfs4:nfs4_encode_getacl_request
+    echo IO     GOOD      nfs4:nfs4_decode_getacl_response
+    echo IO     GOOD      nfs4:nfs4_encode_setacl_request
+    echo IO     GOOD      nfs4:nfs4_decode_setacl_response
+    echo IO     GOOD      nfs4:nfs4_encode_fs_locations_request
+    echo IO     GOOD      nfs4:nfs4_decode_fs_locations_response
+    echo IO     GOOD      nfs4:nfs4_encode_release_lockowner_request
+    echo IO     GOOD      nfs4:nfs4_decode_release_lockowner_response
+    echo IO     GOOD      nfs4:nfs4_encode_secinfo_request
+    echo IO     GOOD      nfs4:nfs4_decode_secinfo_response
+    echo IO     GOOD      nfs4:nfs4_encode_fsid_present_request
+    echo IO     GOOD      nfs4:nfs4_decode_fsid_present_response
+    echo IO     GOOD      nfs4:nfs4_encode_exchange_id_request
+    echo IO     GOOD      nfs4:nfs4_decode_exchange_id_response
+    echo IO     GOOD      nfs4:nfs4_encode_create_session_request
+    echo IO     GOOD      nfs4:nfs4_decode_create_session_response
+    echo IO     GOOD      nfs4:nfs4_encode_destroy_session_request
+    echo IO     GOOD      nfs4:nfs4_decode_destroy_session_response
+    echo IO     GOOD      nfs4:nfs4_encode_sequence_request
+    echo IO     GOOD      nfs4:nfs4_decode_sequence_response
+    echo IO     GOOD      nfs4:nfs4_encode_get_lease_time_request
+    echo IO     GOOD      nfs4:nfs4_decode_get_lease_time_response
+    echo IO     GOOD      nfs4:nfs4_encode_reclaim_complete_request
+    echo IO     GOOD      nfs4:nfs4_decode_reclaim_complete_response
+    echo IO     GOOD      nfs4:nfs4_encode_getdeviceinfo_request
+    echo IO     GOOD      nfs4:nfs4_decode_getdeviceinfo_response
+    echo IO     GOOD      nfs4:nfs4_encode_layoutget_request
+    echo IO     GOOD      nfs4:nfs4_decode_layoutget_response
+    echo IO     GOOD      nfs4:nfs4_encode_layoutcommit_request
+    echo IO     GOOD      nfs4:nfs4_decode_layoutcommit_response
+    echo IO     GOOD      nfs4:nfs4_encode_layoutreturn_request
+    echo IO     GOOD      nfs4:nfs4_decode_layoutreturn_response
+    echo IO     GOOD      nfs4:nfs4_encode_secinfo_no_name_request
+    echo IO     GOOD      nfs4:nfs4_decode_secinfo_no_name_response
+    echo IO     GOOD      nfs4:nfs4_encode_test_stateid_request
+    echo IO     GOOD      nfs4:nfs4_decode_test_stateid_response
+    echo IO     GOOD      nfs4:nfs4_encode_free_stateid_request
+    echo IO     GOOD      nfs4:nfs4_decode_free_stateid_response
+    echo IO     GOOD      nfs4:nfs4_encode_bind_conn_to_session_request
+    echo IO     GOOD      nfs4:nfs4_decode_bind_conn_to_session_response
+    echo IO     GOOD      nfs4:nfs4_encode_destroy_clientid_request
+    echo IO     GOOD      nfs4:nfs4_decode_destroy_clientid_response
+    echo IO     GOOD      nfs4:nfs4_encode_seek_request
+    echo IO     GOOD      nfs4:nfs4_decode_seek_response
+    echo IO     GOOD      nfs4:nfs4_encode_allocate_request
+    echo IO     GOOD      nfs4:nfs4_decode_allocate_response
+    echo IO     GOOD      nfs4:nfs4_encode_deallocate_request
+    echo IO     GOOD      nfs4:nfs4_decode_deallocate_response
+    echo IO     GOOD      nfs4:nfs4_encode_layoutstats_request
+    echo IO     GOOD      nfs4:nfs4_decode_layoutstats_response
+    echo IO     GOOD      nfs4:nfs4_encode_clone_request
+    echo IO     GOOD      nfs4:nfs4_decode_clone_response
+    echo IO     GOOD      nfs4:nfs4_encode_copy_request
+    echo IO     GOOD      nfs4:nfs4_decode_copy_response
+    echo IO     GOOD      nfs4:nfs4_encode_offload_cancel_request
+    echo IO     GOOD      nfs4:nfs4_decode_offload_cancel_response
+    echo IO     GOOD      nfs4:nfs4_encode_copy_notify_request
+    echo IO     GOOD      nfs4:nfs4_decode_copy_notify_response
+    echo IO     GOOD      nfs4:nfs4_encode_lookupp_request
+    echo IO     GOOD      nfs4:nfs4_decode_lookupp_response
+    echo IO     EH        nfs4:nfs4_encode_layouterror_request
+    echo IO     EH        nfs4:nfs4_decode_layouterror_response
+    echo IO     GOOD      nfs4:nfs4_encode_getxattr_request
+    echo IO     GOOD      nfs4:nfs4_decode_getxattr_response
+    echo IO     GOOD      nfs4:nfs4_encode_setxattr_request
+    echo IO     GOOD      nfs4:nfs4_decode_setxattr_response
+    echo IO     GOOD      nfs4:nfs4_encode_listxattrs_request
+    echo IO     GOOD      nfs4:nfs4_decode_listxattrs_response
+    echo IO     GOOD      nfs4:nfs4_encode_removexattr_request
+    echo IO     GOOD      nfs4:nfs4_decode_removexattr_response
+    echo IO     GOOD      nfs4:nfs4_encode_read_plus_request
+    echo IO     GOOD      nfs4:nfs4_decode_read_plus_response
+    echo IO     GOOD      nfs:nfs3_encode_getattr_request
+    echo IO     GOOD      nfs:nfs3_decode_getattr_response
+    echo IO     GOOD      nfs:nfs3_encode_setattr_request
+    echo IO     GOOD      nfs:nfs3_decode_setattr_response
+    echo IO     GOOD      nfs:nfs3_encode_lookup_request
+    echo IO     GOOD      nfs:nfs3_decode_lookup_response
+    echo IO     GOOD      nfs:nfs3_encode_access_request
+    echo IO     GOOD      nfs:nfs3_decode_access_response
+    echo IO     GOOD      nfs:nfs3_encode_readlink_request
+    echo IO     GOOD      nfs:nfs3_decode_readlink_response
+    echo IO     GOOD      nfs:nfs3_encode_read_request
+    echo IO     GOOD      nfs:nfs3_decode_read_response
+    echo IO     GOOD      nfs:nfs3_encode_write_request
+    echo IO     GOOD      nfs:nfs3_decode_write_response
+    echo IO     GOOD      nfs:nfs3_encode_create_request
+    echo IO     GOOD      nfs:nfs3_decode_create_response
+    echo IO     GOOD      nfs:nfs3_encode_mkdir_request
+    echo IO     GOOD      nfs:nfs3_encode_symlink_request
+    echo IO     GOOD      nfs:nfs3_encode_mknod_request
+    echo IO     GOOD      nfs:nfs3_encode_rename_request
+    echo IO     GOOD      nfs:nfs3_decode_rename_response
+    echo IO     GOOD      nfs:nfs3_encode_remove_request
+    echo IO     GOOD      nfs:nfs3_decode_remove_response
+    echo IO     GOOD      nfs:nfs3_encode_link_request
+    echo IO     GOOD      nfs:nfs3_decode_link_response
+    echo IO     GOOD      nfs:nfs3_encode_readdir_request
+    echo IO     GOOD      nfs:nfs3_decode_readdir_response
+    echo IO     GOOD      nfs:nfs3_encode_readdirplus_request
+    echo IO     GOOD      nfs:nfs3_decode_fsstat_response
+    echo IO     GOOD      nfs:nfs3_decode_fsinfo_response
+    echo IO     GOOD      nfs:nfs3_decode_pathconf_response
+    echo IO     GOOD      nfs:nfs3_encode_commit_request
+    echo IO     GOOD      nfs:nfs3_decode_commit_response
+    echo IO     GOOD      nfs:nfs3_encode_setacl_request
+    echo IO     GOOD      nfs:nfs3_decode_setacl_response
+    echo IO     GOOD      nfs:nfs3_encode_getacl_request
+    echo IO     GOOD      nfs:nfs3_decode_getacl_response
+    echo IO     GOOD      nfs:nfs_statfs_enter
+    echo IO     GOOD      nfs:nfs_statfs_exit
+    echo IO     GOOD      nfs:nfs3proc_fsinfo
+    echo IO     GOOD      nfs:nfs3proc_getattr
+    echo IO     GOOD      nfs:nfs3proc_access
+    echo IO     GOOD      nfs:nfs3proc_readdir
+    echo IO     GOOD      nfs:nfs3proc_readdirplus
+    echo IO     GOOD      nfs:nfs3proc_lookup
+    echo META   GOOD      nfs:nfs_client_new
+    echo META   GOOD      nfs:nfs_client_free_start
+    echo META   GOOD      nfs:nfs_client_free_done
+    echo META   GOOD      nfs:nfs_server_new
+    echo META   GOOD      nfs:nfs_server_bind_nfs_client
+    echo META   GOOD      nfs:nfs_server_clone
+    echo META   GOOD      nfs:nfs_server_bind_rpc_client
+    echo META   GOOD      nfs:nfs_server_free_start
+    echo META   GOOD      nfs:nfs_server_free_done
+    echo META   GOOD      nfs:nfs_fs_context_new
+    echo META   GOOD      nfs:nfs_fs_context_parse_param
+    echo META   EH        nfs:nfs_fs_context_parse_param_err
+    echo META   GOOD      nfs:nfs_fs_context_log
+    echo META   GOOD      nfs:nfs_fs_context_bind_nfs_server
+    echo META   GOOD      nfs:nfs_fs_context_dup
+    echo META   GOOD      nfs:nfs_fs_context_free_start
+    echo META   GOOD      nfs:nfs_fs_context_free_done
+    echo META   GOOD      nfs:mount_new
+    echo IO     GOOD      nfs:mnt_encode_dirpath_request
+    echo IO     GOOD      nfs:mnt_decode_mountres_response
+    echo IO     GOOD      nfs:mnt_decode_mountres3_response
+    echo IO     GOOD      nfs:nlm4_encode_test_request
+    echo IO     GOOD      nfs:nlm4_encode_testres_request
+    echo IO     GOOD      nfs:nlm4_encode_lock_request
+    echo IO     GOOD      nfs:nlm4_encode_canc_request
+    echo IO     GOOD      nfs:nlm4_encode_unlock_request
+    echo IO     GOOD      nfs:nlm4_encode_res_request
+    echo IO     GOOD      nfs:nlm4_decode_testres_response
+    echo IO     GOOD      nfs:nlm4_decode_test_response
+    echo IO     GOOD      nfs:nlm4_decode_res_response
+    echo IO     GOOD      nfs:nlm4_decode_norep_response
+    echo IO     GOOD      nfs:nsm_encode_mon_request
+    echo IO     GOOD      nfs:nsm_encode_unmon_request
+    echo IO     GOOD      nfs:nsm_decode_stat_res_response
+    echo IO     GOOD      nfs:nsm_decode_stat_response
+    echo IO     GOOD      nfs:nlm_encode_test_request
+    echo IO     GOOD      nfs:nlm_encode_testres_request
+    echo IO     GOOD      nfs:nlm_encode_lock_request
+    echo IO     GOOD      nfs:nlm_encode_canc_request
+    echo IO     GOOD      nfs:nlm_encode_unlock_request
+    echo IO     GOOD      nfs:nlm_encode_res_request
+    echo IO     GOOD      nfs:nlm_decode_testres_response
+    echo IO     GOOD      nfs:nlm_decode_test_response
+    echo IO     GOOD      nfs:nlm_decode_res_response
+    echo IO     GOOD      nfs:nlm_decode_norep_response
+    echo IO     GOOD      rpcgss:rpcgss_import_ctx
+    echo IO     GOOD      rpcgss:rpcgss_get_mic
+    echo IO     GOOD      rpcgss:rpcgss_verify_mic
+    echo IO     GOOD      rpcgss:rpcgss_wrap
+    echo IO     GOOD      rpcgss:rpcgss_unwrap
+    echo IO     GOOD      rpcgss:rpcgss_ctx_init
+    echo IO     GOOD      rpcgss:rpcgss_ctx_destroy
+    echo IO     GOOD      rpcgss:rpcgss_svc_unwrap
+    echo IO     GOOD      rpcgss:rpcgss_svc_mic
+    echo IO     GOOD      rpcgss:rpcgss_svc_unwrap_failed
+    echo IO     GOOD      rpcgss:rpcgss_svc_seqno_bad
+    echo IO     GOOD      rpcgss:rpcgss_svc_accept_upcall
+    echo IO     GOOD      rpcgss:rpcgss_svc_authenticate
+    echo IO     GOOD      rpcgss:rpcgss_unwrap_failed
+    echo IO     GOOD      rpcgss:rpcgss_bad_seqno
+    echo IO     GOOD      rpcgss:rpcgss_seqno
+    echo IO     GOOD      rpcgss:rpcgss_need_reencode
+    echo IO     GOOD      rpcgss:rpcgss_update_slack
+    echo IO     GOOD      rpcgss:rpcgss_svc_seqno_large
+    echo IO     GOOD      rpcgss:rpcgss_svc_seqno_seen
+    echo IO     GOOD      rpcgss:rpcgss_svc_seqno_low
+    echo IO     GOOD      rpcgss:rpcgss_upcall_msg
+    echo IO     GOOD      rpcgss:rpcgss_upcall_result
+    echo IO     GOOD      rpcgss:rpcgss_context
+    echo IO     GOOD      rpcgss:rpcgss_createauth
+    echo IO     GOOD      rpcgss:rpcgss_oid_to_mech
+    echo META   GOOD      rpcrdma:xprtrdma_cm_event
+    echo META   EH        rpcrdma:xprtrdma_cm_event_err
+    echo META   GOOD      rpcrdma:xprtrdma_state_transition
+    echo IO     GOOD      sunrpc:rpcb_encode_mapping_request
+    echo IO     GOOD      sunrpc:rpcb_encode_getaddr_request
+    echo IO     GOOD      sunrpc:rpcb_decode_set_response
+    echo IO     GOOD      sunrpc:rpcb_decode_getport_response
+    echo IO     GOOD      sunrpc:rpcb_decode_getaddr_response
+    echo META   EH        sunrpc:rpc_clnt_register_err
+    echo META   EH        sunrpc:rpc_tcp_socket_timer
+    echo META   GOOD      sunrpc:xprt_alloc
+    echo META   GOOD      sunrpc:xprt_free
+    echo META   GOOD      sunrpc:xprt_switch_alloc
+    echo META   GOOD      sunrpc:xprt_switch_free
+    echo META   GOOD      sunrpc:xprt_switch_bind
+    echo META   GOOD      sunrpc:xprt_switch_unbind
+    echo IO     GOOD      sunrpc:rpc_task_state_transition
+    echo META   GOOD      sunrpc:walltime_correlation
+}
+
+list-possible-tracepoints() {
+    trace-cmd list | grep -E '^('${KMOD_SET}'):'
+}
+
+filtered-unsupported-tracepoints() {
+    local x=$(list-possible-tracepoints | tr '\n' '|')
+    grep -vE "^${x%|}$"
+}
+
+list-unclassified-possible-tracepoints() {
+    local x=$(all-tracepoints | tr '\n' '|')
+    list-possible-tracepoints | grep -vE "${x%|}"
+}
+
+filtered-tracepoints() {
+    classified-tracepoints | awk "$1"'{print $3}'
+}
+
+meta-tracepoints() {
+    filtered-tracepoints '$1 == "META" || $2 == "EH"'
+}
+
+all-tracepoints() {
+    filtered-tracepoints ''
+}
+
+perf-events() {
+    local regex=$($1 | tr '\n' '|')
+
+    perf list tracepoint | grep -E '[ \t]+('${KMOD_SET}'):.*\[Tracepoint event\]' \
+	| awk '{print $1}' | grep -E "${regex::-1}"
+}
+
+trace-cmd-events() {
+    local regex=$($1 | tr '\n' '|')
+
+    trace-cmd list | grep -E '('${KMOD_SET}'):' \
+	| awk '{print $1}' | grep -E "${regex::-1}"
+}
+
+nfs-trace-help() {
+    if [[ "$#" == 0 ]] ; then
+	echo ""
+	local command
+	for command in perf trace-cmd; do
+	    if [[ $(which ${command} 2>/dev/null) != "" ]] ; then
+		echo The ${command} command is available. For additional help, please use:
+		if [[ "${command}" == "trace-cmd" ]] ; then
+		    command=cmd
+		fi
+		_bold echo "    ${BASH_SOURCE} trace help ${command}"
+	    else
+		echo The ${command} command is not available. Please install it
+		echo using a package manager.
+		echo
+		if [[ "$(rpm -qa | grep ^coreutils 2>/dev/null)" != "" ]] ; then
+		    echo
+		    _bold echo '    sudo yum install -y '${command}
+		elif [[ "$(dpkg -l | grep ^coreutils 2>/dev/null)" != "" ]] ; then
+		    echo
+		    _bold echo '    sudo apt-get install -y '${command}
+		fi
+	    fi
+	    echo
+	done
+    elif [[ "$1" == "perf" ]] ; then
+	_push $1; shift
+	echo "Useful perf commands:"
+	echo
+	_bold echo "    perf list"
+	echo "        List all the possible event types to trace"
+	echo
+	_bold echo "    perf trace -e sunrpc:\* -e nfs:\* -e rpcrdma:\*"
+	echo "        Live trace of all NFS layer events"
+	echo
+	_bold echo "    ${BASH_SOURCE} trace perf meta"
+	echo "        Live trace of all NFS layer meta-data events (mounts, connections)"
+	echo ""
+	_bold echo "    ${BASH_SOURCE} trace perf all"
+	echo "        Live trace of all NFS layer events"
+	echo ""
+	echo "Useful arguments:"
+	echo ""
+	echo "    -T		     boot-time relative timestamp"
+	echo "    --max-stack=<num>  collect backtrace from each event"
+	echo ""
+	echo "Note: perf trace does not diagnose enum values."
+	echo ""
+    elif [[ "$1" == "cmd" ]] ; then
+	_push $1; shift
+	echo "Useful trace-cmd commands:"
+	echo
+	_bold echo "    trace-cmd list"
+	echo "        List all the events"
+	echo
+	_bold echo "    trace-cmd stream -e sunrpc:\* -e nfs:\* -e rpcrdma:\*"
+	echo "        Live trace of all NFS layer events"
+	echo
+	_bold echo "    $(show-cmd-context) meta"
+	echo "        Live trace of all NFS layer meta-data events (mounts, connections)"
+	echo ""
+	_bold echo "    $(show-cmd-context) all"
+	echo "        Live trace of all NFS layer events"
+	echo ""
+	_bold echo "    $(show-cmd-context) collect <args>"
+	echo "        Use trace-cmd to collect binary trace data."
+	echo ""
+	_bold echo "    $(show-cmd-context) save --outdir <dir>"
+	echo "        Save in-RAM-buffer traces to <dir>."
+	echo "        "
+	echo ""
+	echo "        Run without arguments for further help."
+	echo ""
+	echo "Note: trace-cmd may do buffering in the live stream mode."
+    fi
+}
+
+nfs-trace-perf() {
+    if [[ "$#" == 0 ]] ; then
+	perf "$@"
+    elif [[ "$1" == "meta" ]] ; then
+	shift
+	perf trace $@ $(perf-events meta-tracepoints | awk '{print "-e " $1}')
+    elif [[ "$1" == "all" ]] ; then
+	shift
+	perf trace $@ $(perf-events all-tracepoints | awk '{print "-e " $1}')
+    else
+	perf "$@"
+    fi
+}
+
+trace-cmd-collect-help() {
+    echo ""
+    _bold echo "    $(show-cmd-context) (params...)"
+    echo ""
+    echo "This utility captures kernel traces of the NFS layer. By default it will save"
+    echo "traces to dedicated kernel RAM buffers. To download the content of these buffers"
+    echo "to a file, use 'save' command in addition to collect. To view the content of the"
+    echo "file, use 'trace-cmd report'."
+    echo
+    echo "Requirements: trace-cmd installed, output-dir not on NFS, admin privileges."
+    echo
+    echo "Example specification:"
+    echo
+    _bold \
+    echo "     $(show-cmd-context)  buffer meta 100 class meta  buffer io 1000 class all"
+    echo
+    echo "     Means to collect meta-data trace-points to a total 100 MB across CPUs"
+    echo "     and a total 1000 MB buffer across CPUs for all IO based tracepoints."
+    echo ""
+    echo "Parameters:"
+    _bold \
+    echo ""
+    _bold \
+    echo "     outdir <path>"
+    echo "          Optionally, in addition to background collection into RAM, run in the foregrgound "
+    echo "          and save traces to <path>. Use the parameter to '--fs' to deterine how to limit"
+    echo "          the saved buffers."
+    echo ""
+    _bold \
+    echo "     fs <number> (default value: ${fs} of output file-system size)"
+    echo "          Total amount used for FS buffers"
+}
+
+trace-cmd-collect() {
+    local ram=%15
+    local fs=%45
+
+    if [[ "$#" == 0 ]] ; then
+	trace-cmd-collect-help
+	return
+    fi
+
+    local outdir=""
+
+    max_ram_kb=$(cat /proc/meminfo | grep ^MemTotal: | awk '{print $2}')
+    cpus=$(cat /proc/cpuinfo | grep ^processor | wc -l)
+
+    local cmd_events=()
+    local classes=()
+    local nrbuffers=0
+    local last_bufsize="default"
+    local outdir_fs_type=""
+    local max_fs_kb=""
+
+    declare -A cmd_events_array
+
+    echo "Checking tracepoints..."
+    echo
+
+    while [[ $# != 0 ]] ; do
+	if [[ "$1" == "outdir" ]] ; then
+	    shift
+	    outdir="$1"
+	    shift
+
+	    if [[ ! -d "${outdir}" ]] ; then
+		echo "$(show-cmd-context) error: ${outdir} does not exist"
+		exit -1
+	    fi
+
+	    outdir_fs_type=$(df -Th ${outdir} | grep -v ^Filesystem  | awk '{print $2}')
+
+	    max_fs_kb=$(df ${outdir} | grep -v ^Filesystem | awk '{print $2}')
+	    continue
+	elif [[ "$1" == "fs" ]] ; then
+	    shift
+	    fs="$1"
+	    shift
+	    continue
+	elif [[ "$1" == "help" ]] ; then
+	    trace-cmd-collect-help
+	    return
+	elif [[ "$1" == "buffer" ]] ; then
+	    shift
+	    if (( $# <= 1 )) ; then
+		echo "error: 'buffer' requires two arguments [MB size] [name]"
+		exit -1
+	    fi
+
+	    local name="$1"
+	    local size="$2"
+	    shift 2
+
+	    nrbuffers=$((${nrbuffers} + 1))
+	    cmd_events+=(-B ${name})
+
+	    local ramwithoutp=${size#"%"}
+	    if [[ ${ramwithoutp} != ${size} ]] ; then
+		bufsize_kb=$((${max_ram_kb} / ${cpus} * ${ramwithoutp} / 100))
+	    else
+		bufsize_kb=$((1024 * ${size} / ${cpus}))
+	    fi
+
+	    cmd_events+=(-b ${bufsize_kb})
+	    last_bufsize="$((${cpus} * ${bufsize_kb} / 1024)) MB"
+	elif [[ "$1" == "class" ]] ; then
+	    shift
+	    if [[ $# == 0 ]] ; then
+		echo "error: 'class' requires an argument"
+		exit -1
+	    fi
+
+	    local class="$1"
+	    case ${class} in
+		meta) funcclass="meta-tracepoints" ;;
+		all) funcclass="all-tracepoints" ;;
+		*)
+		    echo "invalid trace class ${class}"
+		    return
+	    esac
+
+	    local count=0
+	    for event in $($funcclass); do
+		local eventid=$(echo ${event} | sed s/:/__/g)
+		set +u
+		local defined=${cmd_events_array[${eventid}]}
+		set -u
+		if [[ "${defined}" == "" ]] ; then
+		    cmd_events_array[${eventid}]=1
+		    cmd_events+=(-e ${event})
+		    count=$((${count} + 1))
+		fi
+	    done
+
+	    local temp=(class ${class} $count events bufsize ${last_bufsize})
+	    classes+=("\n    " "${temp[@]}")
+	    shift
+	    continue
+	else
+	    break
+	fi
+    done
+
+    log-and-stdout() {
+	echo "$@"
+	if [[ "${outdir}" != "" ]] ; then
+	    echo "$@" >> collect.log
+	fi
+    }
+
+    if [[ "${outdir}" != "" ]] ; then
+	log-and-stdout "Output directory: ${outdir}"
+	log-and-stdout "Output FS type: ${outdir_fs_type}"
+    fi
+
+    has-trace-cmd-feature() {
+	(trace-cmd record --help 2>&1; true) | grep -qE '[ \t]+\-'${1}
+    }
+
+    if [[ "${outdir}" != "" ]] ; then
+        local params=(record -i)
+    else
+        local params=(start -i)
+    fi
+
+    params=("${params[@]}" "${cmd_events[@]}")
+
+    # log-and-stdout "Trace class: ${class}"
+
+    if has-trace-cmd-feature C ; then
+	params=(${params[@]} -C global)
+    fi
+
+    if [[ "${outdir}" != "" ]] ; then
+	if has-trace-cmd-feature m ; then
+	    local fswithoutp=${fs#"%"}
+	    local fslimit
+
+	    if [[ ${fswithoutp} != ${fs} ]] ; then
+		fslimit=$((${max_fs_kb} / ${cpus} * ${fswithoutp} / 100))
+	    else
+		fslimit=$((${fs} * 1024 / ${cpus}))
+	    fi
+
+	    echo "FS storage for traces: $(( ${fslimit} / 1024 * ${cpus} )) MB"
+	    echo
+	    params=(${params[@]} -m ${fslimit})
+	fi
+    fi
+
+    echo -e "Events: ${classes[@]}"
+    echo
+
+    if [[ "${outdir}" != "" ]] ; then
+	cd ${outdir}
+
+	echo "VAST NFS collect.sh" > collect.log
+	echo "" >> collect.log
+	echo "Saving logfile: $(realpath collect.log)"
+	echo "unix-date: $(date +%s)" >> collect.log
+	echo "proc-uptime: $(cat /proc/uptime)" >> collect.log
+
+	run-cmd() {
+	    local exe="$1"
+	    shift
+	    "${exe}" "${params[@]}" "$@"
+	}
+
+	run-cmd echo "$@ ">> collect.log
+	echo "Running trace-cmd. Wait for it to prompt readiness."
+	run-cmd trace-cmd "$@"
+
+	echo
+	echo "Collection done, ${outdir} can be packed and sent."
+    else
+	echo "Instructing trace-cmd to start background collection to RAM..."
+	trace-cmd "${params[@]}" "$@"
+	echo "Done setting up: traces are now being collected into a RAM buffer."
+	echo
+    fi
+}
+
+trace-cmd-save() {
+    local outdir=""
+
+    while [[ $# != 0 ]] ; do
+	if [[ "$1" == "--outdir" ]] ; then
+	    shift
+	    outdir="$1"
+	    shift
+	    continue
+	elif [[ "$1" == "--help" ]] ; then
+	    return
+	else
+	    break
+	fi
+    done
+
+    local tmp_dir=""
+    local tmp_name=nfs-traces-$(date '+%Y%m%d-%H%M%S')
+
+    if [[ "${outdir}" == "" ]] ; then
+	tmp_dir=$(mktemp -d -t vastnfs-tmp-XXXXXXXXXX)
+	outdir="${tmp_dir}/${tmp_name}"
+	mkdir -p ${outdir}
+    else
+	if [[ ! -d "${outdir}" ]] ; then
+	    echo "$(show-cmd-context) error: ${outdir} does not exist"
+	    exit -1
+	fi
+    fi
+
+    local orig_dir=$(pwd)
+    cd ${outdir}
+
+    if [[ "${tmp_dir}" == "" ]] ; then
+	echo "Saving tracing data to ${outdir}..."
+    else
+	echo "Saving tracing data to ${tmp_name}.tar.gz... (via ${tmp_dir})"
+    fi
+
+    echo
+    echo "(note: the tracing RAM buffer is pruged and 'collect' will be "
+    echo "       needed to be used again to collect new data)"
+
+    echo "VAST NFS collect.sh" > collect.log
+    echo "" >> collect.log
+    echo "unix-date: $(date +%s)" >> collect.log
+    echo "proc-uptime: $(cat /proc/uptime)" >> collect.log
+
+    trace-cmd extract -t -a "$@" >> collect.log 2>&1
+
+    if [[ "${tmp_dir}" != "" ]] ; then
+	cd ${tmp_dir}
+
+	# Pack it up
+	tar -czf ${orig_dir}/${tmp_name}.tar.gz ${tmp_name}
+	echo
+	ls -l ${orig_dir}/${tmp_name}.tar.gz
+	echo
+	cd - 1>/dev/null
+
+	# Cleanup
+	rm -rf ${tmp_dir}/${tmp_name}
+	rmdir ${tmp_dir}
+    fi
+
+    echo "Done. Please send the resultant file listed above to developers."
+}
+
+nfs-trace-cmd() {
+    if [[ "$#" == 0 ]] ; then
+	trace-cmd "$@"
+    elif [[ "$1" == "meta" ]] ; then
+	_push $1; shift
+	trace-cmd stream -i $@ $(trace-cmd-events meta-tracepoints | awk '{print "-e " $1}')
+    elif [[ "$1" == "all" ]] ; then
+	_push $1; shift
+	trace-cmd stream -i $@ $(trace-cmd-events all-tracepoints | awk '{print "-e " $1}')
+    elif [[ "$1" == "collect" ]] ; then
+	_push $1; shift
+	trace-cmd-collect "$@"
+    elif [[ "$1" == "save" ]] ; then
+	_push $1; shift
+	trace-cmd-save "$@"
+    elif [[ "$1" == "list-possible-tracepoints" ]] || \
+         [[ "$1" == "list-unclassified-possible-tracepoints" ]]; \
+    then
+	$1 "$@"
+    else
+	trace-cmd "$@"
+    fi
+}
+
+nfs-trace() {
+    if [[ "$#" == 0 ]] ; then
+	echo "$(show-cmd-context) [help/perf/cmd]"
+    elif [[ "$1" == "help" ]] ; then
+	shift
+	nfs-trace-help "$@"
+    elif [[ "$1" == "perf" ]] ; then
+	_push $1; shift
+	nfs-trace-perf "$@"
+    elif [[ "$1" == "cmd" ]] ; then
+	_push $1; shift
+	nfs-trace-cmd "$@"
+    else
+	echo "unknown command ${1}"
+	return
+    fi
+}
+
+check_single_path_param() {
+    if [ $# -ne 2 ] ;then
+        echo "usage: $0 $1 path"
+    elif test -e "$2" ;then
+        return 1
+    else
+        echo "path \"$2\" doesn't exist"
+    fi 1>&2
+}
+
+get_fsid_from_path() {
+    declare -a LINE
+    local FSROOT=`df -a --output=target "$1" |& tail -n 1`
+    if test -z "${FSROOT}" ;then
+        FSROOT="$1"
+    fi
+    while read -r -a LINE ;do
+        if [ "${LINE[4]}" == "${FSROOT}" ] ;then
+            echo "${LINE[2]}"
+	    return 0
+        fi
+    done < /proc/self/mountinfo
+}
+
+get_nfs_clients() {
+    local FSID=$(get_fsid_from_path "$1")
+    if test -z "${FSID}" ;then
+        echo "\"${1}\" isn't valid path" 1>&2
+	return 1
+    fi
+    find /sys/kernel/debug/vastnfs/nfs_sb -type f \
+    | sort -n | while read -r FNAME ;do
+        declare -A NFS_SB
+        while IFS=":" read -r NAME VALUE ;do
+            local n="$(echo -n $NAME)"
+            local v="$(echo -n $VALUE)"
+            eval NFS_SB["${n}"]=\"${v}\"
+        done < "$FNAME"
+        if [ "${NFS_SB["sb_id"]}" == "${FSID}" ] ;then
+            echo "${NFS_SB["nfs_id"]}"
+        fi
+    done
+}
+
+show_nfs_clients() {
+    if check_single_path_param "$@" ;then
+        return 1
+    fi
+    get_nfs_clients "$2" | while read -r NFS_CLNT_ID ;do
+        local NFS_CLNT_INFO="/sys/kernel/debug/vastnfs/nfs_clnt/${NFS_CLNT_ID}"
+        if test -f "${NFS_CLNT_INFO}" ; then
+            echo "NFS client ${NFS_CLNT_ID}"
+            while read -r LINE ;do
+                if test -n "${LINE}" ;then
+                    echo "        ${LINE}"
+                fi
+            done < "${NFS_CLNT_INFO}"
+        fi 2>/dev/null || true
+    done
+}
+
+show_rpc_clients() {
+    show_nfs_clients "$@" | sed -n 's/^[[:blank:]]*rpc_clnt:[[:blank:]]*//p' \
+    | sort -n | uniq | while read -r RPC_CLNT_ID ;do
+        local RPC_SWITCH_ID=`readlink "/sys/kernel/sunrpc/rpc-clients/clnt-${RPC_CLNT_ID}/switch" |& sed "s/^.*-//" || true`
+        if test -z "${RPC_SWITCH_ID}" ;then
+            echo "rpc_client: ${RPC_CLNT_ID}"
+        else
+            echo "rpc_client: ${RPC_CLNT_ID} switch-${RPC_SWITCH_ID}"
+        fi
+        local RPC_CLNT_DIR="$(printf "/sys/kernel/debug/sunrpc/rpc_clnt/%x" "${RPC_CLNT_ID}")"
+        cat "${RPC_CLNT_DIR}/extra" 2>/dev/null || true
+        cat "${RPC_CLNT_DIR}/stats" 2>/dev/null || true
+    done
+}
+
+get_rpc_switches() {
+    show_nfs_clients "$@" | sed -n 's/^[[:blank:]]*rpc_clnt:[[:blank:]]*//p' | while read -r RPC_CLNT_ID ;do
+	readlink "/sys/kernel/sunrpc/rpc-clients/clnt-${RPC_CLNT_ID}/switch" |& sed "s/^.*-//" || true
+    done | sort -n | uniq
+}
+
+show_rpc_switches() {
+    get_rpc_switches "$@" | while read -r RPC_SWITCH_ID ;do
+        local SWITCH_DIR="/sys/kernel/sunrpc/xprt-switches/switch-${RPC_SWITCH_ID}"
+        if test -d "${SWITCH_DIR}" ;then
+            echo "RPC switch-${RPC_SWITCH_ID}"
+            while read -r LINE ;do
+                if test -n "${LINE}" ;then
+                    echo "        ${LINE}"
+                fi
+            done < "${SWITCH_DIR}/xprt_switch_info" || true
+
+            find "${SWITCH_DIR}" -type d -maxdepth 1 -name 'xprt*' | sort -n | while read -r DNAME ;do
+                local XPRT_NAME=$(basename "${DNAME}")
+                echo -n "        ${XPRT_NAME}: "
+                cat "${DNAME}/xprt_state" | sed -n 's/^state=[[:blank:]]*//p' || true
+            done
+        fi 2>/dev/null
+    done
+}
+
+get_rpc_xprt_dirs () {
+    show_nfs_clients "$@" | sed -n 's/^[[:blank:]]*rpc_clnt:[[:blank:]]*//p' \
+    | while read -r RPC_CLNT_ID ;do
+        local RPC_SWITCH_ID=`readlink "/sys/kernel/sunrpc/rpc-clients/clnt-${RPC_CLNT_ID}/switch" |& sed "s/^.*-//" || true`
+        if test -n "${RPC_SWITCH_ID}" ;then
+            local RPC_SWITCH_DIR="/sys/kernel/sunrpc/xprt-switches/switch-${RPC_SWITCH_ID}"
+            if test -d "${RPC_SWITCH_DIR}" ;then
+                find "${RPC_SWITCH_DIR}" -type d -maxdepth 1 -name 'xprt*'
+            fi
+        fi
+    done | sort -n | uniq
+}
+
+show_rpc_xprt_full() {
+    local XPRT_NAME=`basename $1`
+    local XPRT_STATE=`sed 's/^.*=//' < $1/xprt_state`
+    echo "${XPRT_NAME} ${XPRT_STATE}"
+
+    local SRC_ADDR=${XPRT_PROP["localport"]}
+    if test -z "${SRC_ADDR}" ;then
+        local SRC_ADDR=`cat $1/srcaddr 2>/dev/null || true`
+    fi
+    if test -n "${SRC_ADDR}" ;then
+        echo "        srcaddr=${SRC_ADDR}"
+    fi
+
+    local DST_ADDR=`cat $1/dstaddr 2>/dev/null || true`
+    if test -z "${DST_ADDR}" ;then
+        DST_ADDR=${XPRT_PROP["addr"]}
+    fi
+    if test -n "${DST_ADDR}";then
+        echo "        dstaddr=${DST_ADDR}"
+    fi
+
+    while read -r LINE ;do
+        if test -n "${LINE}" ;then
+            echo "        ${LINE}"
+        fi
+    done < "${1}/xprt_info" 2>/dev/null || true
+
+    if test -n "${XPRT_PROP["pci_device"]}" ;then
+        echo "        pci_device=${XPRT_PROP["pci_device"]}"
+    fi
+    echo "        remote_port_idx=${XPRT_PROP["remote_port_idx"]}"
+    echo "        reconnection_attempts=${XPRT_PROP["reconnection_attempts"]}"
+    echo "        transport=${XPRT_PROP["xprt"]}"
+}
+
+show_rpc_xprt_ifneed() {
+    declare -A XPRT_PROP
+    XPRT_PROP["addr"]=""
+    XPRT_PROP["localport"]=""
+    XPRT_PROP["pci_device"]=""
+
+    local XPRT_INFO_FILE=`echo "$1" | sed 's:/extra$:/info:'`
+    if test -f "${XPRT_INFO_FILE}" ;then
+        while IFS=":" read -r NAME VALUE ;do
+            local n="$(echo -n ${NAME})"
+            local v="$(echo -n ${VALUE})"
+            eval XPRT_PROP["${n}"]=\"${v}\"
+        done < "${XPRT_INFO_FILE}"
+    fi
+    while IFS=":" read -r NAME VALUE ;do
+        local n="$(echo -n ${NAME})"
+        local v="$(echo -n ${VALUE})"
+        eval XPRT_PROP["${n}"]=\"${v}\"
+    done < "$1"
+
+    local KEY XPRT_ID="${XPRT_PROP["id"]}"
+    for KEY in "${!XPRT_ID_TABLE[@]}" ;do
+        if [ "${KEY}" == "${XPRT_ID}" ] ;then
+            local XPRT_INFO_DIR="${XPRT_ID_TABLE["${KEY}"]}"
+            if test -n "${XPRT_INFO_DIR}" ;then
+                show_rpc_xprt_full "${XPRT_INFO_DIR}"
+                break
+            fi
+        fi
+    done
+}
+
+show_rpc_transports()
+{
+    if check_single_path_param "$@" ;then
+        return 1
+    fi
+    local XPRT_INFO_DIR
+    declare -A XPRT_ID_TABLE
+    for XPRT_INFO_DIR in $(get_rpc_xprt_dirs "$@") ;do
+        local XPRT_ID=$(basename "${XPRT_INFO_DIR}" | sed -e 's/^[^-]*-//' -e 's/-[^-]*$//')
+        if test -n "${XPRT_ID}" ;then
+            eval XPRT_ID_TABLE["${XPRT_ID}"]=\"${XPRT_INFO_DIR}\"
+        fi
+    done
+    find /sys/kernel/debug/sunrpc/rpc_xprt -type f -name extra | while read -r XPRT_VAST_FILE ;do
+         show_rpc_xprt_ifneed "${XPRT_VAST_FILE}"
+    done
+}
+
+help() {
+    echo syntax:
+    echo
+    echo     $(show-cmd-context) [reload/status/trace/nfs-clients/rpc-clients/rpc-switches/rpc-transports]
+}
+
+if [[ "$#" == 0 ]] ; then
+    help
+    exit 0
+fi
+
+cmd=$1
+_push $1; shift
+case ${cmd} in
+    status)
+	vastnfs-status "$@" ;;
+    reload)
+	vastnfs-reload "$@" ;;
+    trace)
+	nfs-trace "$@" ;;
+    nfs-clients)
+	show_nfs_clients ${cmd} "$@" ;;
+    rpc-clients)
+	show_rpc_clients ${cmd} "$@" ;;
+    rpc-switches)
+	show_rpc_switches ${cmd} "$@" ;;
+    rpc-transports)
+	show_rpc_transports ${cmd} "$@" ;;
+    func) "$@" ;;
+    help) help ;;
+    *) echo "vastnfs-ctl: invalid command: ${cmd}"; exit -1 ;;
+esac

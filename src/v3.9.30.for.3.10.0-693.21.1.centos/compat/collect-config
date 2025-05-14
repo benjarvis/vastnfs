@@ -1,0 +1,156 @@
+#!/bin/bash
+
+set -euo pipefail
+
+get-test-layer() {
+    set +e
+    local num=$(cat "$1" | grep 'LAYER:' | sed -E 's#/[*] LAYER: ([0-9]+) [*]/#\1#g')
+    set -e
+    if [[ "${num}" == "" ]] ; then
+	echo 1
+    else
+	echo ${num}
+    fi
+}
+
+list-srcs() {
+    local layer="$1"
+    cd checks
+    for i in *.c ; do
+	if [[ "$(get-test-layer ${i})" != "$layer" ]] ; then
+	    continue
+	fi
+	echo -n " " ${i%.c}.o
+    done
+    cd ..
+}
+
+run-build() {
+    local layer=${1}
+    shift
+    rm -f checks/Makefile checks/*.mod.c
+    echo "obj-m += $(list-srcs ${layer})" > checks/Makefile
+    cores=$(grep -c ^processor /proc/cpuinfo)
+    make -k -j${cores} "$@"  M=$(pwd)/checks 2>> errors.log || true
+}
+
+generate-config() {
+    set +u
+    local layer=${1}
+    shift || true
+    set -u
+
+    undefined_one() {
+	nm -C $@ | grep ' U ' | awk '{print $2}'
+    }
+
+    undefined_all_as_extern_asm() {
+	for i in checks/*.o ; do
+	    undefined_one ${i}  | awk '{print "\".quad " $1 "; \""}'
+	done
+    }
+
+    get_unexported() {
+	local count=$(undefined_all_as_extern_asm | sort | uniq | wc -l)
+	if (( ${count} > 0 )) ; then
+	    mkdir -p checks-export
+	    echo '#include <linux/module.h>' > checks-export/export-check.c
+	    echo 'asm(' >> checks-export/export-check.c
+	    undefined_all_as_extern_asm | sort | uniq >> checks-export/export-check.c || true
+	    echo ');' >> checks-export/export-check.c
+	    echo 'MODULE_LICENSE("GPL");' >> checks-export/export-check.c
+
+	    rm -f checks-export/Makefile checks-export/*.mod.c || true
+	    echo "obj-m += export-check.o" > checks-export/Makefile
+	    local cores=$(grep -c ^processor /proc/cpuinfo)
+	    rm -f export-errors.log
+	    make -j${cores} "$@" M=$(pwd)/checks-export 2>> export-errors.log || true
+	else
+	    echo > export-errors.log
+	fi
+    }
+
+    if [[ "${layer}" != "" ]] ; then
+	get_unexported "$@"
+    fi
+
+    for i in checks/*.c ; do
+	set +e
+	echo ${i} | grep -qE '^.*[.]mod[.]c$'
+	if [[ $? == "0" ]] ; then
+	    continue
+	fi
+	set -e
+
+	if [[ "${layer}" != "" ]] ; then
+	    if [[ "$(get-test-layer ${i})" != "$layer" ]] ; then
+		continue
+	    fi
+	fi
+
+	local j=${i#"checks/"}
+	ID=$(echo ${j%.c} | awk '{ print toupper($0) }')
+
+	if [[ -e checks/${j%.c}.o ]] ; then
+	    if grep -q 'CHECK UNDEFINED: ' checks/${j} ; then
+		# See that all symbols undefined are indeed undefined
+
+		local failed=0
+		for symbol in $(grep 'CHECK UNDEFINED: ' checks/${j} | sed -E 's,.*CHECK UNDEFINED: ([^ ]*) .*,\1,g') ; do
+		    if undefined_one checks/${j%.c}.o | grep -q -E '^'${symbol}'$' ; then
+			:
+		    else
+			failed=1
+		    fi
+		done
+
+		if [[ "${failed}" == "1" ]] ; then
+		    echo "/* #undef COMPAT_DETECT_${ID} (not undefined) */"
+		else
+		    echo "#define COMPAT_DETECT_${ID}"
+		fi
+
+		continue
+	    fi
+
+	    if grep \"${j%.c}\" export-errors.log >/dev/null; then
+		echo "/* #undef COMPAT_DETECT_${ID} (not exported) */"
+	    else
+		echo "#define COMPAT_DETECT_${ID}"
+	    fi
+	else
+	    echo "/* #undef COMPAT_DETECT_${ID} */"
+	fi
+    done
+}
+
+cd $(dirname ${BASH_SOURCE})
+
+rm -f ../compat.h ../compat-after.h
+echo > ../compat.h
+echo > ../compat-after.h
+
+rm -f checks/*.o checks/*.ko errors.log
+
+layer=1
+while true; do
+    if [[ "$(list-srcs ${layer})" == "" ]] ; then
+	break
+    fi
+
+    echo Layer: ${layer}
+    run-build ${layer} "$@"
+    generate-config ${layer} "$@"
+    generate-config > ../compat.h
+    layer=$(( ${layer} + 1 ))
+done
+
+echo -n $(cat ../compat.h | grep -E '^#define (.*)$' | sed -E 's/^#define (.*)/\1=y/g') \
+    > ../compat.env
+
+# Extra config injection based on compat check results
+
+if ! grep -q FSCACHE_INDEX_COOKIE=y ../compat.env ; then
+    echo " CONFIG_NFS_FSCACHE=" >> ../compat.env
+    echo "#undef CONFIG_NFS_FSCACHE" >> ../compat-after.h
+fi

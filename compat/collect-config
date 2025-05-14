@@ -1,0 +1,244 @@
+#!/bin/bash
+
+set -euo pipefail
+
+get-kernel-root() {
+    local _c=0
+
+    while [[ $# != 0 ]] ; do
+	if [[ "$1" == "-C" ]] ; then
+	    _c=1
+	elif [[ "$_c" == "1" ]] ; then
+	    echo $1
+	    return
+	fi
+	shift
+    done
+}
+
+get-overrides() {
+    while [[ $# != 0 ]] ; do
+	if [[ "$1" =~ ^VASTNFS_OVERRIDES=(.*)$ ]] ; then
+	    echo "${BASH_REMATCH[1]}"
+	    return
+	fi
+	shift
+    done
+}
+
+kernel_root=$(get-kernel-root "$@")
+
+if [[ ! -d "${kernel_root}" ]] ; then
+    echo "Kernel root not found"
+    exit -1
+fi
+
+if [[ ! -e ${kernel_root}/include/linux/kernel.h ]] ; then
+    echo Headers not in ${kernel_root}, trying via Makefile
+    real_kernel_path="$(realpath ${kernel_root})"
+    if [[ -e ${real_kernel_path}/Makefile ]] ; then
+	indirect_makefile="$(realpath ${real_kernel_path}/Makefile)"
+	include_in_makefile="$(cat ${indirect_makefile} | (grep ^include || true) | head -n 1 | awk '{print $2}')"
+	if [[ "${include_in_makefile}" == "" ]] ; then
+	    makeargs_c="$(cat ${indirect_makefile} | (grep '^MAKEARGS := -C' || true) | awk '{print $4}')"
+	    if [[ "${makeargs_c}" != "" ]] ; then
+		include_in_makefile="${makeargs_c}/Makefile"
+	    fi
+	fi
+	if [[ "${include_in_makefile}" == "" ]] ; then
+	    echo "Did not find a kernel header root via build symlink Makefile"
+	    exit -1
+	fi
+	makefile_redirection="$(dirname "${include_in_makefile}")"
+	if [[ "${makefile_redirection}" =~ ^/.* ]]; then
+	    # Absolute
+	    kernel_root="${makefile_redirection}"
+	else
+	    # Relative
+	    kernel_root="$(realpath ${real_kernel_path}/${makefile_redirection})"
+	fi
+    fi
+fi
+
+if [[ ! -e ${kernel_root}/include/linux/kernel.h ]] ; then
+    echo "Did not find kernel headers in any location"
+    exit -1
+fi
+
+get-test-layer() {
+    set +e
+    local num=$(cat "$1" | grep 'LAYER:' | sed -E 's#/[*] LAYER: ([0-9]+) [*]/#\1#g')
+    set -e
+    if [[ "${num}" == "" ]] ; then
+	echo 1
+    else
+	echo ${num}
+    fi
+}
+
+list-srcs() {
+    local layer="$1"
+    cd checks
+    for i in *.c ; do
+	if [[ "$(get-test-layer ${i})" != "$layer" ]] ; then
+	    continue
+	fi
+	echo -n " " ${i%.c}.o
+    done
+    cd ..
+}
+
+run-build() {
+    local layer=${1}
+    shift
+    rm -f checks/Makefile checks/*.mod.c
+    echo 'ccflags-y += -I$(src)	# needed for trace events' > checks/Makefile
+    echo "obj-m += $(list-srcs ${layer})" >> checks/Makefile
+    cores=$(grep -c ^processor /proc/cpuinfo)
+    make -k -j${cores} "$@"  M=$(pwd)/checks 2>> errors.log || true
+}
+
+generate-config() {
+    set +u
+    local layer=${1}
+    shift || true
+    set -u
+
+    undefined_one() {
+	nm -C $@ | grep ' U ' | awk '{print $2}'
+    }
+
+    undefined_all_as_extern_asm() {
+	for i in checks/*.o ; do
+	    undefined_one ${i}  | awk '{print "\".quad " $1 "; \""}'
+	done
+    }
+
+    get_unexported() {
+	local count=$(undefined_all_as_extern_asm | sort | uniq | wc -l)
+	if (( ${count} > 0 )) ; then
+	    mkdir -p checks-export
+	    echo '#include <linux/module.h>' > checks-export/export-check.c
+	    echo 'asm(' >> checks-export/export-check.c
+	    undefined_all_as_extern_asm | sort | uniq >> checks-export/export-check.c || true
+	    echo ');' >> checks-export/export-check.c
+	    echo 'MODULE_LICENSE("GPL");' >> checks-export/export-check.c
+
+	    rm -f checks-export/Makefile checks-export/*.mod.c || true
+	    echo "obj-m += export-check.o" > checks-export/Makefile
+	    local cores=$(grep -c ^processor /proc/cpuinfo)
+	    rm -f export-errors.log
+	    make -j${cores} "$@" M=$(pwd)/checks-export 2>> export-errors.log || true
+	else
+	    echo > export-errors.log
+	fi
+    }
+
+    if [[ "${layer}" != "" ]] ; then
+	get_unexported "$@"
+    fi
+
+    for i in checks/*.c ; do
+	set +e
+	echo ${i} | grep -qE '^.*[.]mod[.]c$'
+	if [[ $? == "0" ]] ; then
+	    continue
+	fi
+	set -e
+
+	if [[ "${layer}" != "" ]] ; then
+	    if [[ "$(get-test-layer ${i})" != "$layer" ]] ; then
+		continue
+	    fi
+	fi
+
+	local j=${i#"checks/"}
+	ID=$(echo ${j%.c} | awk '{ print toupper($0) }')
+
+	if [[ -e checks/${j%.c}.o ]] ; then
+	    if grep -q 'CHECK UNDEFINED: ' checks/${j} ; then
+		# See that all symbols undefined are indeed undefined
+
+		local failed=0
+		for symbol in $(grep 'CHECK UNDEFINED: ' checks/${j} | sed -E 's,.*CHECK UNDEFINED: ([^ ]*) .*,\1,g') ; do
+		    if undefined_one checks/${j%.c}.o | grep -q -E '^'${symbol}'$' ; then
+			:
+		    else
+			failed=1
+		    fi
+		done
+
+		if [[ "${failed}" == "1" ]] ; then
+		    echo "/* #undef COMPAT_DETECT_${ID} (not undefined) */"
+		else
+		    echo "#define COMPAT_DETECT_${ID}"
+		fi
+
+		continue
+	    fi
+
+	    if grep \"${j%.c}\" export-errors.log >/dev/null; then
+		echo "/* #undef COMPAT_DETECT_${ID} (not exported) */"
+	    else
+		echo "#define COMPAT_DETECT_${ID}"
+	    fi
+	else
+	    echo "/* #undef COMPAT_DETECT_${ID} */"
+	fi
+    done
+}
+
+cd $(dirname ${BASH_SOURCE})
+
+rm -f ../compat.h ../compat-after.h
+echo > ../compat.h
+echo > ../compat-after.h
+
+rm -f checks/*.o checks/*.ko errors.log
+
+layer=1
+while true; do
+    if [[ "$(list-srcs ${layer})" == "" ]] ; then
+	break
+    fi
+
+    echo Layer: ${layer}
+    run-build ${layer} "$@"
+    generate-config ${layer} "$@"
+    generate-config > ../compat.h
+    layer=$(( ${layer} + 1 ))
+done
+
+# sysctl: pass kernel pointers to ->proc_handler ("32927393dc1ccd60fb")
+if grep -q 'void __user ' ${kernel_root}/include/linux/sysctl.h; then
+    echo "#define COMPAT_DETECT_SYSCTL_USER_BUF" >> ../compat.h
+else
+    echo "/* #undef COMPAT_DETECT_SYSCTL_USER_BUF */" >> ../compat.h
+fi
+
+echo -n $(cat ../compat.h | grep -E '^#define (.*)$' | sed -E 's/^#define (.*)/\1=y/g') \
+    > ../compat.env
+
+# Extra config injection based on compat check results
+
+if ! grep -q FSCACHE_INDEX_COOKIE=y ../compat.env ; then
+    echo " CONFIG_NFS_FSCACHE=" >> ../compat.env
+    echo "#undef CONFIG_NFS_FSCACHE" >> ../compat-after.h
+fi
+
+echo "#undef CONFIG_NFS_V4_1_IMPLEMENTATION_ID_DOMAIN" >> ../compat-after.h
+
+for override in $(get-overrides "$@"); do
+    if [[ "${override}" =~ ^(.*)=(m|y)$ ]] ; then
+	echo "#undef ${BASH_REMATCH[1]}" >> ../compat-after.h
+	echo "#define ${BASH_REMATCH[1]} 1" >> ../compat-after.h
+    elif [[ "${override}" =~ ^(.*)=n$ ]] ; then
+	echo "#undef ${BASH_REMATCH[1]}" >> ../compat-after.h
+    elif [[ "${override}" =~ ^(.*)=(\".*\")$ ]] ; then
+	echo "#undef ${BASH_REMATCH[1]}" >> ../compat-after.h
+	echo "#define ${BASH_REMATCH[1]} ${BASH_REMATCH[2]}" >> ../compat-after.h
+    else
+	echo "compat/collect-config: unable to handle override: ${override}"
+	exit -1
+    fi
+done

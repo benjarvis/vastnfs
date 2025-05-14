@@ -1,0 +1,71 @@
+#!/bin/bash
+
+# Remove current bin/ dir from PATH:
+curdir=$(realpath $(dirname ${BASH_SOURCE}))
+path_tmp=$(while read p; do
+    if [[ "$(realpath "${p}")" == "$curdir" ]] ; then
+	continue
+    fi
+    echo "$p"
+done < <(echo $PATH | tr ':' '\n') | tr '\n' ':')
+export PATH=${path_tmp%:}
+
+# Now we know what is the original compiler
+ORIG_GCC=$(which gcc)
+
+positional=()
+filter=0
+filename=""
+
+# Now find the .c files which are NOT supposed to compile against layers,
+# and remove the relevant command line arguments.
+
+for arg in "$@"; do
+    if [[ "$arg" =~ sunrpc/addr_external.c$ ]] ; then
+	filter=1
+	filename="$arg"
+    fi
+done
+
+if [[ "$filter" == "1" ]] ; then
+    >&2 echo "Excluding OFED and compat layer headers from ${filename}"
+
+    while [[ $# != 0 ]] ; do
+	drop=0
+	if [[ "$1" =~ compat-2.6.h$ ]] ; then
+	    drop=2
+	fi
+	if [[ "$1" =~ .ofa_kernel/include$ ]] ; then
+	    drop=1
+	fi
+	if [[ "$1" =~ .ofa_kernel/include/uapi$ ]] ; then
+	    drop=1
+	fi
+	if [[ "$1" =~ ^-DMLNX_OFED_WRAPPING$ ]] ; then
+	    drop=1
+	fi
+
+	# Compat headers
+	if [[ "$1" =~ compat/include$ ]] ; then
+	    drop=1
+	fi
+	if [[ "$1" =~ ^compat-after.h$ ]] ; then
+	    drop=2
+	fi
+	if [[ "$1" =~ ^compat.h$ ]] ; then
+	    drop=2
+	fi
+	positional+=("$1")
+
+	while [[ "$drop" != 0 ]] ; do
+	    unset 'positional[-1]'
+	    drop=$(($drop - 1))
+	done
+
+	shift
+    done
+
+    set -- "${positional[@]}"
+fi
+
+exec ${ORIG_GCC} "$@"

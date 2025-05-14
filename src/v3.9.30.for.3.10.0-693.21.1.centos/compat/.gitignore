@@ -1,0 +1,15 @@
+built-in.a
+Module.symvers
+modules.order
+*.cmd
+.tmp_versions/
+*.o
+*.gcno
+*.ko
+.*.o.d
+*.mod.c
+*.mod
+errors.log
+Module.symvers
+export-errors.log
+/checks-export/

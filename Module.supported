@@ -1,0 +1,15 @@
+lockd.ko external
+nfs.ko external
+nfs_acl.ko external
+compat_nfs_ssc.ko external
+nfs_layout_flexfiles.ko external
+nfs_layout_nfsv41_files.ko external
+blocklayoutdriver.ko external
+nfsd.ko external
+nfsv2.ko external
+nfsv3.ko external
+nfsv4.ko external
+rpcrdma.ko external
+auth_rpcgss.ko external
+rpcsec_gss_krb5.ko external
+sunrpc.ko external

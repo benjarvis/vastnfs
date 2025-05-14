@@ -1,0 +1,10 @@
+--- .ofa_kernel/include/linux/compat-3.12.h.to.fix	2022-11-27 08:53:20.355706464 +0200
++++ .ofa_kernel/include/linux/compat-3.12.h.to.fix	2022-11-27 08:53:54.527596704 +0200
+@@ -28,2 +28,3 @@
+ 
++#if (0)
+ #define file_inode LINUX_BACKPORT(file_inode)
+@@ -33,2 +34,3 @@
+ }
++#endif
+ 

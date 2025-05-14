@@ -1,0 +1,722 @@
+diff --git a/bundle/fs/nfs/Makefile b/bundle/fs/nfs/Makefile
+index 866441795..6abdda209 100644
+--- a/bundle/fs/nfs/Makefile
++++ b/bundle/fs/nfs/Makefile
+@@ -6,7 +6,7 @@ obj-$(CONFIG_NFS_FS) += nfs.o
+ 
+ CFLAGS_nfstrace.o += -I$(src)
+ nfs-y 			:= client.o dir.o file.o getroot.o inode.o super.o \
+-			   direct.o pagelist.o read.o symlink.o unlink.o \
++			   io.o direct.o pagelist.o read.o symlink.o unlink.o \
+ 			   write.o namespace.o mount_clnt.o nfstrace.o
+ nfs-$(CONFIG_ROOT_NFS)	+= nfsroot.o
+ nfs-$(CONFIG_SYSCTL)	+= sysctl.o
+diff --git a/bundle/fs/nfs/direct.c b/bundle/fs/nfs/direct.c
+index 245296715..f639618b7 100644
+--- a/bundle/fs/nfs/direct.c
++++ b/bundle/fs/nfs/direct.c
+@@ -374,22 +374,10 @@ out:
+  * Synchronous I/O uses a stack-allocated iocb.  Thus we can't trust
+  * the iocb is still valid here if this is a synchronous request.
+  */
+-static void nfs_direct_complete(struct nfs_direct_req *dreq, bool write)
++static void nfs_direct_complete(struct nfs_direct_req *dreq)
+ {
+ 	struct inode *inode = dreq->inode;
+ 
+-	if (dreq->iocb && write) {
+-		loff_t pos = dreq->iocb->ki_pos + dreq->count;
+-
+-		spin_lock(&inode->i_lock);
+-		if (i_size_read(inode) < pos)
+-			i_size_write(inode, pos);
+-		spin_unlock(&inode->i_lock);
+-	}
+-
+-	if (write)
+-		nfs_zap_mapping(inode, inode->i_mapping);
+-
+ 	inode_dio_end(inode);
+ 
+ 	if (dreq->iocb) {
+@@ -442,7 +430,7 @@ static void nfs_direct_read_completion(struct nfs_pgio_header *hdr)
+ 	}
+ out_put:
+ 	if (put_dreq(dreq))
+-		nfs_direct_complete(dreq, false);
++		nfs_direct_complete(dreq);
+ 	hdr->release(hdr);
+ }
+ 
+@@ -606,7 +594,7 @@ static ssize_t nfs_direct_read_schedule_iovec(struct nfs_direct_req *dreq,
+ 	}
+ 
+ 	if (put_dreq(dreq))
+-		nfs_direct_complete(dreq, false);
++		nfs_direct_complete(dreq);
+ 	return 0;
+ }
+ 
+@@ -652,17 +640,12 @@ ssize_t nfs_file_direct_read(struct kiocb *iocb, const struct iovec *iov,
+ 	if (!count)
+ 		goto out;
+ 
+-	mutex_lock(&inode->i_mutex);
+-	result = nfs_sync_mapping(mapping);
+-	if (result)
+-		goto out_unlock;
+-
+ 	task_io_account_read(count);
+ 
+ 	result = -ENOMEM;
+ 	dreq = nfs_direct_req_alloc();
+ 	if (dreq == NULL)
+-		goto out_unlock;
++		goto out;
+ 
+ 	dreq->inode = inode;
+ 	dreq->bytes_left = iov_length(iov, nr_segs);
+@@ -677,10 +660,12 @@ ssize_t nfs_file_direct_read(struct kiocb *iocb, const struct iovec *iov,
+ 	if (!is_sync_kiocb(iocb))
+ 		dreq->iocb = iocb;
+ 
++	nfs_start_io_direct(inode);
++
+ 	NFS_I(inode)->read_io += iov_length(iov, nr_segs);
+ 	result = nfs_direct_read_schedule_iovec(dreq, iov, nr_segs, pos, uio);
+ 
+-	mutex_unlock(&inode->i_mutex);
++	nfs_end_io_direct(inode);
+ 
+ 	if (!result) {
+ 		result = nfs_direct_wait(dreq);
+@@ -688,13 +673,8 @@ ssize_t nfs_file_direct_read(struct kiocb *iocb, const struct iovec *iov,
+ 			iocb->ki_pos = pos + result;
+ 	}
+ 
+-	nfs_direct_req_release(dreq);
+-	return result;
+-
+ out_release:
+ 	nfs_direct_req_release(dreq);
+-out_unlock:
+-	mutex_unlock(&inode->i_mutex);
+ out:
+ 	return result;
+ }
+@@ -846,7 +826,8 @@ static void nfs_direct_write_schedule_work(struct work_struct *work)
+ 			nfs_direct_write_reschedule(dreq);
+ 			break;
+ 		default:
+-			nfs_direct_complete(dreq, true);
++			nfs_zap_mapping(dreq->inode, dreq->inode->i_mapping);
++			nfs_direct_complete(dreq);
+ 	}
+ }
+ 
+@@ -1143,25 +1124,12 @@ ssize_t nfs_file_direct_write(struct kiocb *iocb, const struct iovec *iov,
+ 	if (!count)
+ 		goto out;
+ 
+-	mutex_lock(&inode->i_mutex);
+-
+-	result = nfs_sync_mapping(mapping);
+-	if (result)
+-		goto out_unlock;
+-
+-	if (mapping->nrpages) {
+-		result = invalidate_inode_pages2_range(mapping,
+-					pos >> PAGE_CACHE_SHIFT, end);
+-		if (result)
+-			goto out_unlock;
+-	}
+-
+ 	task_io_account_write(count);
+ 
+ 	result = -ENOMEM;
+ 	dreq = nfs_direct_req_alloc();
+ 	if (!dreq)
+-		goto out_unlock;
++		goto out;
+ 
+ 	dreq->inode = inode;
+ 	dreq->bytes_left = count;
+@@ -1176,6 +1144,8 @@ ssize_t nfs_file_direct_write(struct kiocb *iocb, const struct iovec *iov,
+ 	if (!is_sync_kiocb(iocb))
+ 		dreq->iocb = iocb;
+ 
++	nfs_start_io_direct(inode);
++
+ 	result = nfs_direct_write_schedule_iovec(dreq, iov, nr_segs, pos, uio);
+ 
+ 	if (mapping->nrpages) {
+@@ -1183,28 +1153,18 @@ ssize_t nfs_file_direct_write(struct kiocb *iocb, const struct iovec *iov,
+ 					      pos >> PAGE_CACHE_SHIFT, end);
+ 	}
+ 
+-	mutex_unlock(&inode->i_mutex);
++	nfs_end_io_direct(inode);
+ 
+ 	if (!result) {
+ 		result = nfs_direct_wait(dreq);
+ 		if (result > 0) {
+-			struct inode *inode = mapping->host;
+-
+ 			iocb->ki_pos = pos + result;
+-			spin_lock(&inode->i_lock);
+-			if (i_size_read(inode) < iocb->ki_pos)
+-				i_size_write(inode, iocb->ki_pos);
+-			spin_unlock(&inode->i_lock);
+ 			generic_write_sync(file, pos, result);
+ 		}
+ 	}
+-	nfs_direct_req_release(dreq);
+-	return result;
+ 
+ out_release:
+ 	nfs_direct_req_release(dreq);
+-out_unlock:
+-	mutex_unlock(&inode->i_mutex);
+ out:
+ 	return result;
+ }
+diff --git a/bundle/fs/nfs/file.c b/bundle/fs/nfs/file.c
+index 23d911115..3952d50a5 100644
+--- a/bundle/fs/nfs/file.c
++++ b/bundle/fs/nfs/file.c
+@@ -172,12 +172,14 @@ nfs_file_read(struct kiocb *iocb, const struct iovec *iov,
+ 		iocb->ki_filp,
+ 		(unsigned long) iov_length(iov, nr_segs), (unsigned long) pos);
+ 
+-	result = nfs_revalidate_mapping_protected(inode, iocb->ki_filp->f_mapping);
++	nfs_start_io_read(inode);
++	result = nfs_revalidate_mapping(inode, iocb->ki_filp->f_mapping);
+ 	if (!result) {
+ 		result = generic_file_aio_read(iocb, iov, nr_segs, pos);
+ 		if (result > 0)
+ 			nfs_add_stats(inode, NFSIOS_NORMALREADBYTES, result);
+ 	}
++	nfs_end_io_read(inode);
+ 	return result;
+ }
+ EXPORT_SYMBOL_GPL(nfs_file_read);
+@@ -193,12 +195,14 @@ nfs_file_splice_read(struct file *filp, loff_t *ppos,
+ 	dprintk("NFS: splice_read(%pD2, %lu@%Lu)\n",
+ 		filp, (unsigned long) count, (unsigned long long) *ppos);
+ 
+-	res = nfs_revalidate_mapping_protected(inode, filp->f_mapping);
++	nfs_start_io_read(inode);
++	res = nfs_revalidate_mapping(inode, filp->f_mapping);
+ 	if (!res) {
+ 		res = generic_file_splice_read(filp, ppos, pipe, count, flags);
+ 		if (res > 0)
+ 			nfs_add_stats(inode, NFSIOS_NORMALREADBYTES, res);
+ 	}
++	nfs_end_io_read(inode);
+ 	return res;
+ }
+ EXPORT_SYMBOL_GPL(nfs_file_splice_read);
+@@ -235,7 +239,7 @@ EXPORT_SYMBOL_GPL(nfs_file_mmap);
+  * nfs_file_write() that a write error occurred, and hence cause it to
+  * fall back to doing a synchronous write.
+  */
+-int
++static int
+ nfs_file_fsync_commit(struct file *file, loff_t start, loff_t end, int datasync)
+ {
+ 	struct nfs_open_context *ctx = nfs_file_open_context(file);
+@@ -265,9 +269,8 @@ nfs_file_fsync_commit(struct file *file, loff_t start, loff_t end, int datasync)
+ out:
+ 	return ret;
+ }
+-EXPORT_SYMBOL_GPL(nfs_file_fsync_commit);
+ 
+-static int
++int
+ nfs_file_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+ {
+ 	int ret;
+@@ -275,14 +278,13 @@ nfs_file_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+ 
+ 	trace_nfs_fsync_enter(inode);
+ 
+-	nfs_inode_dio_wait(inode);
+ 	do {
+ 		ret = filemap_write_and_wait_range(inode->i_mapping, start, end);
+ 		if (ret != 0)
+ 			break;
+-		mutex_lock(&inode->i_mutex);
+ 		ret = nfs_file_fsync_commit(file, start, end, datasync);
+-		mutex_unlock(&inode->i_mutex);
++		if (!ret)
++			ret = pnfs_sync_inode(inode, !!datasync);
+ 		/*
+ 		 * If nfs_file_fsync_commit detected a server reboot, then
+ 		 * resend all dirty pages that might have been covered by
+@@ -295,6 +297,7 @@ nfs_file_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+ 	trace_nfs_fsync_exit(inode, ret);
+ 	return ret;
+ }
++EXPORT_SYMBOL_GPL(nfs_file_fsync);
+ 
+ /*
+  * Decide whether a read/modify/write cycle may be more efficient
+@@ -371,19 +374,6 @@ static int nfs_write_begin(struct file *file, struct address_space *mapping,
+ 		file, mapping->host->i_ino, len, (long long) pos);
+ 
+ start:
+-	/*
+-	 * Prevent starvation issues if someone is doing a consistency
+-	 * sync-to-disk
+-	 */
+-	ret = wait_on_bit_action(&NFS_I(mapping->host)->flags, NFS_INO_FLUSHING,
+-				 nfs_wait_bit_killable, TASK_KILLABLE);
+-	if (ret)
+-		return ret;
+-	/*
+-	 * Wait for O_DIRECT to complete
+-	 */
+-	nfs_inode_dio_wait(mapping->host);
+-
+ 	page = grab_cache_page_write_begin(mapping, index, flags);
+ 	if (!page)
+ 		return -ENOMEM;
+@@ -669,7 +659,6 @@ ssize_t nfs_file_write(struct kiocb *iocb, const struct iovec *iov,
+ 	struct inode *inode = file_inode(file);
+ 	unsigned long written = 0;
+ 	ssize_t result;
+-	size_t count = iov_length(iov, nr_segs);
+ 
+ 	result = nfs_key_timeout_notify(file, inode);
+ 	if (result)
+@@ -679,9 +668,8 @@ ssize_t nfs_file_write(struct kiocb *iocb, const struct iovec *iov,
+ 		return nfs_file_direct_write(iocb, iov, nr_segs, pos, true);
+ 
+ 	dprintk("NFS: write(%pD2, %lu@%Ld)\n",
+-		file, (unsigned long) count, (long long) pos);
++		file, (unsigned long) iov_length(iov, nr_segs), (long long) pos);
+ 
+-	result = -EBUSY;
+ 	if (IS_SWAPFILE(inode))
+ 		goto out_swapfile;
+ 	/*
+@@ -693,28 +681,40 @@ ssize_t nfs_file_write(struct kiocb *iocb, const struct iovec *iov,
+ 			goto out;
+ 	}
+ 
+-	result = count;
+-	if (!count)
+-		goto out;
++	BUG_ON(iocb->ki_pos != pos);
++	nfs_start_io_write(inode);
++	result = __generic_file_aio_write(iocb, iov, nr_segs, &iocb->ki_pos);
++	nfs_end_io_write(inode);
+ 
+-	result = generic_file_aio_write(iocb, iov, nr_segs, pos);
+-	if (result > 0)
+-		written = result;
++	if (result > 0) {
++		ssize_t err;
+ 
+-	/* Return error values */
+-	if (result >= 0 && nfs_need_check_write(file, inode)) {
+-		int err = vfs_fsync(file, 0);
+-		if (err < 0)
++		err = generic_write_sync(file, pos, result);
++		if (err < 0) {
+ 			result = err;
+-	}
+-	if (result > 0)
++			goto out;
++		}
++
++		written = result;
++		/* RHEL: we don't need to adjust iocb->ki_pos, it gets updated
++		 * in generic_file_buffered_write().  Upstream version needs:
++		 * +	iocb->ki_pos += written;
++		 */
++
++		/* Return error values */
++		if (nfs_need_check_write(file, inode)) {
++			int err = vfs_fsync(file, 0);
++			if (err < 0)
++				result = err;
++		}
+ 		nfs_add_stats(inode, NFSIOS_NORMALWRITTENBYTES, written);
++	}
+ out:
+ 	return result;
+ 
+ out_swapfile:
+ 	printk(KERN_INFO "NFS: attempt to write to active swap file!\n");
+-	goto out;
++	return -EBUSY;
+ }
+ EXPORT_SYMBOL_GPL(nfs_file_write);
+ 
+diff --git a/bundle/fs/nfs/inode.c b/bundle/fs/nfs/inode.c
+index 1d19d4514..57afb6c41 100644
+--- a/bundle/fs/nfs/inode.c
++++ b/bundle/fs/nfs/inode.c
+@@ -142,7 +142,7 @@ void nfs_evict_inode(struct inode *inode)
+ 
+ int nfs_sync_inode(struct inode *inode)
+ {
+-	nfs_inode_dio_wait(inode);
++	inode_dio_wait(inode);
+ 	return nfs_wb_all(inode);
+ }
+ EXPORT_SYMBOL_GPL(nfs_sync_inode);
+@@ -1084,7 +1084,6 @@ static int nfs_invalidate_mapping(struct inode *inode, struct address_space *map
+ 
+ 	if (mapping->nrpages != 0) {
+ 		if (S_ISREG(inode->i_mode)) {
+-			unmap_mapping_range(mapping, 0, 0, 0);
+ 			ret = nfs_sync_mapping(mapping);
+ 			if (ret < 0)
+ 				return ret;
+@@ -1946,6 +1945,7 @@ struct inode *nfs_alloc_inode(struct super_block *sb)
+ #if IS_ENABLED(CONFIG_NFS_V4)
+ 	nfsi->nfs4_acl = NULL;
+ #endif /* CONFIG_NFS_V4 */
++	mutex_init(&nfsi->parallel_io_mutex);
+ 	return &nfsi->vfs_inode;
+ }
+ EXPORT_SYMBOL_GPL(nfs_alloc_inode);
+@@ -1987,6 +1987,7 @@ static void init_once(void *foo)
+ 	atomic_set(&nfsi->silly_count, 1);
+ 	INIT_HLIST_HEAD(&nfsi->silly_list);
+ 	init_waitqueue_head(&nfsi->waitqueue);
++	atomic_set(&nfsi->parallel_io_count, 0);
+ 	nfs4_init_once(nfsi);
+ }
+ 
+diff --git a/bundle/fs/nfs/internal.h b/bundle/fs/nfs/internal.h
+index 8fd9c172a..9f8682f97 100644
+--- a/bundle/fs/nfs/internal.h
++++ b/bundle/fs/nfs/internal.h
+@@ -417,7 +417,7 @@ int nfs_mknod(struct inode *, struct dentry *, umode_t, dev_t);
+ int nfs_rename(struct inode *, struct dentry *, struct inode *, struct dentry *);
+ 
+ /* file.c */
+-int nfs_file_fsync_commit(struct file *, loff_t, loff_t, int);
++int nfs_file_fsync(struct file *file, loff_t start, loff_t end, int datasync);
+ loff_t nfs_file_llseek(struct file *, loff_t, int);
+ ssize_t nfs_file_read(struct kiocb *, const struct iovec *, unsigned long, loff_t);
+ ssize_t nfs_file_splice_read(struct file *, loff_t *, struct pipe_inode_info *,
+@@ -473,6 +473,14 @@ extern void __exit unregister_nfs_fs(void);
+ extern bool nfs_sb_active(struct super_block *sb);
+ extern void nfs_sb_deactive(struct super_block *sb);
+ 
++/* io.c */
++extern void nfs_start_io_read(struct inode *inode);
++extern void nfs_end_io_read(struct inode *inode);
++extern void nfs_start_io_write(struct inode *inode);
++extern void nfs_end_io_write(struct inode *inode);
++extern void nfs_start_io_direct(struct inode *inode);
++extern void nfs_end_io_direct(struct inode *inode);
++
+ /* namespace.c */
+ #define NFS_PATH_CANONICAL 1
+ extern char *nfs_path(char **p, struct dentry *dentry,
+@@ -605,10 +613,6 @@ extern int nfs_sillyrename(struct inode *dir, struct dentry *dentry);
+ /* direct.c */
+ void nfs_init_cinfo_from_dreq(struct nfs_commit_info *cinfo,
+ 			      struct nfs_direct_req *dreq);
+-static inline void nfs_inode_dio_wait(struct inode *inode)
+-{
+-	inode_dio_wait(inode);
+-}
+ extern ssize_t nfs_dreq_bytes_left(struct nfs_direct_req *dreq);
+ 
+ /* nfs4proc.c */
+diff --git a/bundle/fs/nfs/io.c b/bundle/fs/nfs/io.c
+new file mode 100644
+index 000000000..830e25112
+--- /dev/null
++++ b/bundle/fs/nfs/io.c
+@@ -0,0 +1,158 @@
++/*
++ * Copyright (c) 2016 Trond Myklebust
++ *
++ * I/O and data path helper functionality.
++ */
++
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <linux/bitops.h>
++#include <linux/rwsem.h>
++#include <linux/fs.h>
++#include <linux/nfs_fs.h>
++
++#include "internal.h"
++
++/* Call with exclusively locked inode->i_rwsem */
++static void nfs_block_o_direct(struct nfs_inode *nfsi, struct inode *inode)
++{
++	if (test_bit(NFS_INO_ODIRECT, &nfsi->flags)) {
++		clear_bit(NFS_INO_ODIRECT, &nfsi->flags);
++		inode_dio_wait(inode);
++	}
++}
++
++/**
++ * nfs_start_io_read - declare the file is being used for buffered reads
++ * @inode - file inode
++ *
++ * Declare that a buffered read operation is about to start, and ensure
++ * that we block all direct I/O.
++ * On exit, the function ensures that the NFS_INO_ODIRECT flag is unset,
++ * and holds a lock on inode->i_mutex to ensure that the flag
++ * cannot be changed.
++ * In practice, this means that buffered read operations are allowed to
++ * execute in parallel, thanks to not needing to grab the lock if another
++ * read is already holding it, whereas direct I/O operations need to wait
++ * until buffered read operations complete to set NFS_INO_ODIRECT.
++ * Note that buffered writes and truncates both take i_mutex, meaning that
++ * those are serialised w.r.t. the reads.
++ */
++void
++nfs_start_io_read(struct inode *inode)
++{
++	struct nfs_inode *nfsi = NFS_I(inode);
++
++	mutex_lock(&nfsi->parallel_io_mutex);
++
++	if (test_bit(NFS_INO_ODIRECT, &nfsi->flags) != 0) {
++		mutex_lock(&inode->i_mutex);
++		nfs_block_o_direct(nfsi, inode);
++		atomic_inc(&nfsi->parallel_io_count);
++	} else if (atomic_inc_return(&nfsi->parallel_io_count) == 1)
++		mutex_lock(&inode->i_mutex);
++
++	mutex_unlock(&nfsi->parallel_io_mutex);
++}
++
++/**
++ * nfs_end_io_read - declare that the buffered read operation is done
++ * @inode - file inode
++ *
++ * Declare that a buffered read operation is done, and release i_mutex if
++ * there are no more read operations.
++ */
++void
++nfs_end_io_read(struct inode *inode)
++{
++	struct nfs_inode *nfsi = NFS_I(inode);
++
++	if (atomic_dec_and_test(&nfsi->parallel_io_count))
++		mutex_unlock(&inode->i_mutex);
++}
++
++/**
++ * nfs_start_io_write - declare the file is being used for buffered writes
++ * @inode - file inode
++ *
++ * Declare that a buffered write operation is about to start, and ensure
++ * that we block all direct I/O.
++ */
++void
++nfs_start_io_write(struct inode *inode)
++{
++	mutex_lock(&inode->i_mutex);
++	nfs_block_o_direct(NFS_I(inode), inode);
++}
++
++/**
++ * nfs_end_io_write - declare that the buffered write operation is done
++ * @inode - file inode
++ *
++ * Declare that a buffered write operation is done, and release the
++ * locks.
++ */
++void
++nfs_end_io_write(struct inode *inode)
++{
++	mutex_unlock(&inode->i_mutex);
++}
++
++/* Call with exclusively locked inode->i_mutex */
++static void nfs_block_buffered(struct nfs_inode *nfsi, struct inode *inode)
++{
++	if (!test_bit(NFS_INO_ODIRECT, &nfsi->flags)) {
++		set_bit(NFS_INO_ODIRECT, &nfsi->flags);
++		nfs_sync_mapping(inode->i_mapping);
++	}
++}
++
++/**
++ * nfs_end_io_direct - declare the file is being used for direct i/o
++ * @inode - file inode
++ *
++ * Declare that a direct I/O operation is about to start, and ensure
++ * that we block all buffered I/O.
++ * On exit, the function ensures that the NFS_INO_ODIRECT flag is set,
++ * and holds a lock on i_mutex to ensure that the flag cannot be
++ * changed.
++ * In practice, this means that direct I/O operations are allowed to
++ * execute in parallel, since we have already taken the lock on the
++ * first operation, whereas buffered I/O operations need to wait for
++ * outstanding direct I/O operations to complete in order to clear
++ * NFS_INO_ODIRECT.
++ * Note that buffered writes and truncates both take a write i_mutex,
++ * meaning that those are serialised w.r.t. O_DIRECT.
++ */
++void
++nfs_start_io_direct(struct inode *inode)
++{
++	struct nfs_inode *nfsi = NFS_I(inode);
++
++	mutex_lock(&nfsi->parallel_io_mutex);
++
++	if (test_bit(NFS_INO_ODIRECT, &nfsi->flags) == 0) {
++		mutex_lock(&inode->i_mutex);
++		nfs_block_buffered(nfsi, inode);
++		atomic_inc(&nfsi->parallel_io_count);
++	} else if (atomic_inc_return(&nfsi->parallel_io_count) == 1)
++		mutex_lock(&inode->i_mutex);
++
++	mutex_unlock(&nfsi->parallel_io_mutex);
++}
++
++/**
++ * nfs_end_io_direct - declare that the direct i/o operation is done
++ * @inode - file inode
++ *
++ * Declare that a direct I/O operation is done, and release the shared
++ * lock on inode->i_rwsem.
++ */
++void
++nfs_end_io_direct(struct inode *inode)
++{
++	struct nfs_inode *nfsi = NFS_I(inode);
++
++	if (atomic_dec_and_test(&nfsi->parallel_io_count))
++		mutex_unlock(&inode->i_mutex);
++}
+diff --git a/bundle/fs/nfs/nfs4file.c b/bundle/fs/nfs/nfs4file.c
+index 0b9f20bc0..02244af82 100644
+--- a/bundle/fs/nfs/nfs4file.c
++++ b/bundle/fs/nfs/nfs4file.c
+@@ -128,37 +128,6 @@ nfs4_file_flush(struct file *file, fl_owner_t id)
+ 	return vfs_fsync(file, 0);
+ }
+ 
+-static int
+-nfs4_file_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+-{
+-	int ret;
+-	struct inode *inode = file_inode(file);
+-
+-	trace_nfs_fsync_enter(inode);
+-
+-	nfs_inode_dio_wait(inode);
+-	do {
+-		ret = filemap_write_and_wait_range(inode->i_mapping, start, end);
+-		if (ret != 0)
+-			break;
+-		mutex_lock(&inode->i_mutex);
+-		ret = nfs_file_fsync_commit(file, start, end, datasync);
+-		if (!ret)
+-			ret = pnfs_sync_inode(inode, !!datasync);
+-		mutex_unlock(&inode->i_mutex);
+-		/*
+-		 * If nfs_file_fsync_commit detected a server reboot, then
+-		 * resend all dirty pages that might have been covered by
+-		 * the NFS_CONTEXT_RESEND_WRITES flag
+-		 */
+-		start = 0;
+-		end = LLONG_MAX;
+-	} while (ret == -EAGAIN);
+-
+-	trace_nfs_fsync_exit(inode, ret);
+-	return ret;
+-}
+-
+ #ifdef CONFIG_NFS_V4_2
+ static ssize_t nfs4_copy_file_range(struct file *file_in, loff_t pos_in,
+ 				    struct file *file_out, loff_t pos_out,
+@@ -279,7 +248,7 @@ const struct file_operations_extend nfs4_file_operations = {
+ 		.open		= nfs4_file_open,
+ 		.flush		= nfs4_file_flush,
+ 		.release	= nfs_file_release,
+-		.fsync		= nfs4_file_fsync,
++		.fsync		= nfs_file_fsync,
+ 		.lock		= nfs_lock,
+ 		.flock		= nfs_flock,
+ 		.splice_read	= nfs_file_splice_read,
+diff --git a/bundle/fs/nfs/nfstrace.h b/bundle/fs/nfs/nfstrace.h
+index 9f80a086b..3734528c2 100644
+--- a/bundle/fs/nfs/nfstrace.h
++++ b/bundle/fs/nfs/nfstrace.h
+@@ -37,7 +37,6 @@
+ 			{ 1 << NFS_INO_ADVISE_RDPLUS, "ADVISE_RDPLUS" }, \
+ 			{ 1 << NFS_INO_STALE, "STALE" }, \
+ 			{ 1 << NFS_INO_INVALIDATING, "INVALIDATING" }, \
+-			{ 1 << NFS_INO_FLUSHING, "FLUSHING" }, \
+ 			{ 1 << NFS_INO_FSCACHE, "FSCACHE" }, \
+ 			{ 1 << NFS_INO_LAYOUTCOMMIT, "NEED_LAYOUTCOMMIT" }, \
+ 			{ 1 << NFS_INO_LAYOUTCOMMITTING, "LAYOUTCOMMIT" })
+diff --git a/bundle/fs/nfs/write.c b/bundle/fs/nfs/write.c
+index 1ab32972c..edd2ec82e 100644
+--- a/bundle/fs/nfs/write.c
++++ b/bundle/fs/nfs/write.c
+@@ -659,16 +659,9 @@ static int nfs_writepages_callback(struct page *page, struct writeback_control *
+ int nfs_writepages(struct address_space *mapping, struct writeback_control *wbc)
+ {
+ 	struct inode *inode = mapping->host;
+-	unsigned long *bitlock = &NFS_I(inode)->flags;
+ 	struct nfs_pageio_descriptor pgio;
+ 	int err;
+ 
+-	/* Stop dirtying of new pages while we sync */
+-	err = wait_on_bit_lock_action(bitlock, NFS_INO_FLUSHING,
+-			nfs_wait_bit_killable, TASK_KILLABLE);
+-	if (err)
+-		goto out_err;
+-
+ 	nfs_inc_stats(inode, NFSIOS_VFSWRITEPAGES);
+ 
+ 	nfs_pageio_init_write(&pgio, inode, wb_priority(wbc), false,
+@@ -676,10 +669,6 @@ int nfs_writepages(struct address_space *mapping, struct writeback_control *wbc)
+ 	err = write_cache_pages(mapping, wbc, nfs_writepages_callback, &pgio);
+ 	nfs_pageio_complete(&pgio);
+ 
+-	clear_bit_unlock(NFS_INO_FLUSHING, bitlock);
+-	smp_mb__after_clear_bit();
+-	wake_up_bit(bitlock, NFS_INO_FLUSHING);
+-
+ 	if (err < 0)
+ 		goto out_err;
+ 	err = pgio.pg_error;
+diff --git a/bundle/include/linux/nfs_fs.h b/bundle/include/linux/nfs_fs.h
+index c6edeec4f..4a5990ea6 100644
+--- a/bundle/include/linux/nfs_fs.h
++++ b/bundle/include/linux/nfs_fs.h
+@@ -190,6 +190,12 @@ struct nfs_inode {
+ #ifdef CONFIG_NFS_FSCACHE
+ 	struct fscache_cookie	*fscache;
+ #endif
++	/* RH note, these two are half of a generic semaphore to do read/writes
++	 * exclusively via direct or buffered IO.  The other mutex in the
++	 * semaphore is i_mutex:
++	 */
++	atomic_t		parallel_io_count;
++	struct mutex	parallel_io_mutex;
+ 	struct inode		vfs_inode;
+ };
+ 
+@@ -212,12 +218,12 @@ struct nfs_inode {
+ #define NFS_INO_STALE		(1)		/* possible stale inode */
+ #define NFS_INO_ACL_LRU_SET	(2)		/* Inode is on the LRU list */
+ #define NFS_INO_INVALIDATING	(3)		/* inode is being invalidated */
+-#define NFS_INO_FLUSHING	(4)		/* inode is flushing out data */
+ #define NFS_INO_FSCACHE		(5)		/* inode can be cached by FS-Cache */
+ #define NFS_INO_FSCACHE_LOCK	(6)		/* FS-Cache cookie management lock */
+ #define NFS_INO_LAYOUTCOMMIT	(9)		/* layoutcommit required */
+ #define NFS_INO_LAYOUTCOMMITTING (10)		/* layoutcommit inflight */
+ #define NFS_INO_LAYOUTSTATS	(11)		/* layoutstats inflight */
++#define NFS_INO_ODIRECT		(12)		/* I/O setting is O_DIRECT */
+ 
+ static inline struct nfs_inode *NFS_I(const struct inode *inode)
+ {

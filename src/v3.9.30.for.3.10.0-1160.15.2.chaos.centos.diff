@@ -1,0 +1,1349 @@
+diff --git a/bundle/fs/nfs/dir.c b/bundle/fs/nfs/dir.c
+index 712b796f9..d9ae5be8f 100644
+--- a/bundle/fs/nfs/dir.c
++++ b/bundle/fs/nfs/dir.c
+@@ -72,6 +72,12 @@ static struct nfs_open_dir_context *alloc_nfs_open_dir_context(struct inode *dir
+ {
+ 	struct nfs_inode *nfsi = NFS_I(dir);
+ 	struct nfs_open_dir_context *ctx;
++	struct group_info *grphint;
++
++	grphint = groups_alloc(1);
++	if (grphint == NULL)
++		return ERR_PTR(-ENOMEM);
++	GROUP_AT(grphint, 0) = dir->i_gid;
+ 	ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+ 	if (ctx != NULL) {
+ 		ctx->duped = 0;
+@@ -79,11 +85,13 @@ static struct nfs_open_dir_context *alloc_nfs_open_dir_context(struct inode *dir
+ 		ctx->dir_cookie = 0;
+ 		ctx->dup_cookie = 0;
+ 		ctx->cred = get_cred(cred);
++		ctx->grphint = grphint;
+ 		spin_lock(&dir->i_lock);
+ 		list_add(&ctx->list, &nfsi->open_files);
+ 		spin_unlock(&dir->i_lock);
+ 		return ctx;
+ 	}
++	put_group_info(grphint);
+ 	return  ERR_PTR(-ENOMEM);
+ }
+ 
+@@ -93,6 +101,7 @@ static void put_nfs_open_dir_context(struct inode *dir, struct nfs_open_dir_cont
+ 	list_del(&ctx->list);
+ 	spin_unlock(&dir->i_lock);
+ 	put_cred(ctx->cred);
++	put_group_info(ctx->grphint);
+ 	kfree(ctx);
+ }
+ 
+@@ -129,7 +138,7 @@ out:
+ static int
+ nfs_closedir(struct inode *inode, struct file *filp)
+ {
+-	put_nfs_open_dir_context(file_inode(filp), filp->private_data);
++	put_nfs_open_dir_context(filp->f_path.dentry->d_inode, filp->private_data);
+ 	return 0;
+ }
+ 
+@@ -373,7 +382,7 @@ int nfs_readdir_xdr_filler(struct page **pages, nfs_readdir_descriptor_t *desc,
+ 	timestamp = jiffies;
+ 	gencount = nfs_inc_attr_generation_counter();
+ 	error = NFS_PROTO(inode)->readdir(file_dentry(file), cred, entry->cookie, pages,
+-					  NFS_SERVER(inode)->dtsize, desc->plus);
++					  NFS_SERVER(inode)->dtsize, desc->plus, ctx->grphint);
+ 	if (error < 0) {
+ 		/* We requested READDIRPLUS, but the server doesn't grok it */
+ 		if (error == -ENOTSUPP && desc->plus) {
+@@ -1129,6 +1138,7 @@ static int nfs_lookup_revalidate(struct dentry *dentry, unsigned int flags)
+ 	struct nfs_fh *fhandle = NULL;
+ 	struct nfs_fattr *fattr = NULL;
+ 	struct nfs4_label *label = NULL;
++	struct group_info *grphint = NULL;
+ 	int error;
+ 
+ 	if (flags & LOOKUP_RCU) {
+@@ -1194,8 +1204,14 @@ static int nfs_lookup_revalidate(struct dentry *dentry, unsigned int flags)
+ 	if (IS_ERR(label))
+ 		goto out_error;
+ 
++	grphint = groups_alloc(1);
++	if (grphint == NULL)
++		goto out_error;
++	GROUP_AT(grphint, 0) = dir->i_gid;
++
+ 	trace_nfs_lookup_revalidate_enter(dir, dentry, flags);
+-	error = NFS_PROTO(dir)->lookup(dir, &dentry->d_name, fhandle, fattr, label);
++	error = NFS_PROTO(dir)->lookup(dir, &dentry->d_name, fhandle, fattr, label,
++				       grphint);
+ 	trace_nfs_lookup_revalidate_exit(dir, dentry, flags, error);
+ 	if (error == -ESTALE || error == -ENOENT)
+ 		goto out_bad;
+@@ -1208,6 +1224,9 @@ static int nfs_lookup_revalidate(struct dentry *dentry, unsigned int flags)
+ 
+ 	nfs_setsecurity(inode, fattr, label);
+ 
++	if (grphint != NULL)
++		put_group_info(grphint);
++
+ 	nfs_free_fattr(fattr);
+ 	nfs_free_fhandle(fhandle);
+ 	nfs4_label_free(label);
+@@ -1230,6 +1249,9 @@ out_zap_parent:
+ 	nfs_zap_caches(dir);
+  out_bad:
+ 	WARN_ON(flags & LOOKUP_RCU);
++	if (grphint != NULL)
++		put_group_info(grphint);
++
+ 	nfs_free_fattr(fattr);
+ 	nfs_free_fhandle(fhandle);
+ 	nfs4_label_free(label);
+@@ -1380,6 +1402,7 @@ struct dentry *nfs_lookup(struct inode *dir, struct dentry * dentry, unsigned in
+ 	struct nfs_fh *fhandle = NULL;
+ 	struct nfs_fattr *fattr = NULL;
+ 	struct nfs4_label *label = NULL;
++	struct group_info *grphint =NULL;
+ 	int error;
+ 
+ 	dfprintk(VFS, "NFS: lookup(%pd2)\n", dentry);
+@@ -1409,11 +1432,16 @@ struct dentry *nfs_lookup(struct inode *dir, struct dentry * dentry, unsigned in
+ 	if (IS_ERR(label))
+ 		goto out;
+ 
++	grphint = groups_alloc(1);
++	if (grphint == NULL)
++		goto out_label;
++	GROUP_AT(grphint, 0) = dir->i_gid;
++
+ 	parent = dentry->d_parent;
+ 	/* Protect against concurrent sillydeletes */
+ 	trace_nfs_lookup_enter(dir, dentry, flags);
+ 	nfs_block_sillyrename(parent);
+-	error = NFS_PROTO(dir)->lookup(dir, &dentry->d_name, fhandle, fattr, label);
++	error = NFS_PROTO(dir)->lookup(dir, &dentry->d_name, fhandle, fattr, label, grphint);
+ 	if (error == -ENOENT)
+ 		goto no_entry;
+ 	if (error < 0) {
+@@ -1439,6 +1467,8 @@ no_entry:
+ out_unblock_sillyrename:
+ 	nfs_unblock_sillyrename(parent);
+ 	trace_nfs_lookup_exit(dir, dentry, flags, error);
++	put_group_info(grphint);
++out_label:
+ 	nfs4_label_free(label);
+ out:
+ 	nfs_free_fattr(fattr);
+@@ -1663,7 +1693,8 @@ no_open:
+  */
+ int nfs_instantiate(struct dentry *dentry, struct nfs_fh *fhandle,
+ 				struct nfs_fattr *fattr,
+-				struct nfs4_label *label)
++				struct nfs4_label *label,
++				struct group_info *grphint)
+ {
+ 	struct dentry *parent = dget_parent(dentry);
+ 	struct inode *dir = parent->d_inode;
+@@ -1676,7 +1707,7 @@ int nfs_instantiate(struct dentry *dentry, struct nfs_fh *fhandle,
+ 	if (dentry->d_inode)
+ 		goto out;
+ 	if (fhandle->size == 0) {
+-		error = NFS_PROTO(dir)->lookup(dir, &dentry->d_name, fhandle, fattr, NULL);
++		error = NFS_PROTO(dir)->lookup(dir, &dentry->d_name, fhandle, fattr, NULL, grphint);
+ 		if (error)
+ 			goto out_error;
+ 	}
+@@ -1714,6 +1745,7 @@ int nfs_create(struct inode *dir, struct dentry *dentry,
+ 	struct iattr attr;
+ 	int open_flags = excl ? O_CREAT | O_EXCL : O_CREAT;
+ 	int error;
++	struct group_info *grphint;
+ 
+ 	dfprintk(VFS, "NFS: create(%s/%lu), %pd\n",
+ 			dir->i_sb->s_id, dir->i_ino, dentry);
+@@ -1721,9 +1753,17 @@ int nfs_create(struct inode *dir, struct dentry *dentry,
+ 	attr.ia_mode = mode;
+ 	attr.ia_valid = ATTR_MODE;
+ 
++	grphint = groups_alloc(1);
++	if (grphint == NULL) {
++		error = -ENOMEM;
++		goto out_err;
++	}
++	GROUP_AT(grphint, 0) = dir->i_gid;
++
+ 	trace_nfs_create_enter(dir, dentry, open_flags);
+-	error = NFS_PROTO(dir)->create(dir, dentry, &attr, open_flags);
++	error = NFS_PROTO(dir)->create(dir, dentry, &attr, open_flags, grphint);
+ 	trace_nfs_create_exit(dir, dentry, open_flags, error);
++	put_group_info(grphint);
+ 	if (error != 0)
+ 		goto out_err;
+ 	return 0;
+@@ -1741,6 +1781,7 @@ nfs_mknod(struct inode *dir, struct dentry *dentry, umode_t mode, dev_t rdev)
+ {
+ 	struct iattr attr;
+ 	int status;
++	struct group_info *grphint;
+ 
+ 	dfprintk(VFS, "NFS: mknod(%s/%lu), %pd\n",
+ 			dir->i_sb->s_id, dir->i_ino, dentry);
+@@ -1748,9 +1789,17 @@ nfs_mknod(struct inode *dir, struct dentry *dentry, umode_t mode, dev_t rdev)
+ 	attr.ia_mode = mode;
+ 	attr.ia_valid = ATTR_MODE;
+ 
++	grphint = groups_alloc(1);
++	if (grphint == NULL) {
++		status = -ENOMEM;
++		goto out_err;
++	}
++	GROUP_AT(grphint, 0) = dir->i_gid;
++
+ 	trace_nfs_mknod_enter(dir, dentry);
+-	status = NFS_PROTO(dir)->mknod(dir, dentry, &attr, rdev);
++	status = NFS_PROTO(dir)->mknod(dir, dentry, &attr, rdev, grphint);
+ 	trace_nfs_mknod_exit(dir, dentry, status);
++	put_group_info(grphint);
+ 	if (status != 0)
+ 		goto out_err;
+ 	return 0;
+@@ -1767,6 +1816,7 @@ int nfs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
+ {
+ 	struct iattr attr;
+ 	int error;
++	struct group_info *grphint;
+ 
+ 	dfprintk(VFS, "NFS: mkdir(%s/%lu), %pd\n",
+ 			dir->i_sb->s_id, dir->i_ino, dentry);
+@@ -1774,9 +1824,17 @@ int nfs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
+ 	attr.ia_valid = ATTR_MODE;
+ 	attr.ia_mode = mode | S_IFDIR;
+ 
++	grphint = groups_alloc(1);
++	if (grphint == NULL) {
++		error = -ENOMEM;
++		goto out_err;
++	}
++	GROUP_AT(grphint, 0) = dir->i_gid;
++
+ 	trace_nfs_mkdir_enter(dir, dentry);
+-	error = NFS_PROTO(dir)->mkdir(dir, dentry, &attr);
++	error = NFS_PROTO(dir)->mkdir(dir, dentry, &attr, grphint);
+ 	trace_nfs_mkdir_exit(dir, dentry, error);
++	put_group_info(grphint);
+ 	if (error != 0)
+ 		goto out_err;
+ 	return 0;
+@@ -1795,14 +1853,20 @@ static void nfs_dentry_handle_enoent(struct dentry *dentry)
+ int nfs_rmdir(struct inode *dir, struct dentry *dentry)
+ {
+ 	int error;
++	struct group_info *grphint;
+ 
+ 	dfprintk(VFS, "NFS: rmdir(%s/%lu), %pd\n",
+ 			dir->i_sb->s_id, dir->i_ino, dentry);
+ 
++	grphint = groups_alloc(1);
++	if (grphint == NULL)
++		return -ENOMEM;
++	GROUP_AT(grphint, 0) = dir->i_gid;
++
+ 	trace_nfs_rmdir_enter(dir, dentry);
+ 	if (dentry->d_inode) {
+ 		nfs_wait_on_sillyrename(dentry);
+-		error = NFS_PROTO(dir)->rmdir(dir, &dentry->d_name);
++		error = NFS_PROTO(dir)->rmdir(dir, &dentry->d_name, grphint);
+ 		/* Ensure the VFS deletes this inode */
+ 		switch (error) {
+ 		case 0:
+@@ -1812,9 +1876,10 @@ int nfs_rmdir(struct inode *dir, struct dentry *dentry)
+ 			nfs_dentry_handle_enoent(dentry);
+ 		}
+ 	} else
+-		error = NFS_PROTO(dir)->rmdir(dir, &dentry->d_name);
++		error = NFS_PROTO(dir)->rmdir(dir, &dentry->d_name, grphint);
+ 	trace_nfs_rmdir_exit(dir, dentry, error);
+ 
++	put_group_info(grphint);
+ 	return error;
+ }
+ EXPORT_SYMBOL_GPL(nfs_rmdir);
+@@ -1831,6 +1896,7 @@ static int nfs_safe_remove(struct dentry *dentry)
+ 	struct inode *dir = dentry->d_parent->d_inode;
+ 	struct inode *inode = dentry->d_inode;
+ 	int error = -EBUSY;
++	struct group_info *grphint;
+ 		
+ 	dfprintk(VFS, "NFS: safe_remove(%pd2)\n", dentry);
+ 
+@@ -1840,17 +1906,25 @@ static int nfs_safe_remove(struct dentry *dentry)
+ 		goto out;
+ 	}
+ 
++	grphint = groups_alloc(1);
++	if (grphint == NULL) {
++		error = -ENOMEM;
++		goto out;
++	}
++	GROUP_AT(grphint, 0) = dir->i_gid;
++
+ 	trace_nfs_remove_enter(dir, dentry);
+ 	if (inode != NULL) {
+ 		NFS_PROTO(inode)->return_delegation(inode);
+-		error = NFS_PROTO(dir)->remove(dir, &dentry->d_name);
++		error = NFS_PROTO(dir)->remove(dir, &dentry->d_name, grphint);
+ 		if (error == 0)
+ 			nfs_drop_nlink(inode);
+ 	} else
+-		error = NFS_PROTO(dir)->remove(dir, &dentry->d_name);
++		error = NFS_PROTO(dir)->remove(dir, &dentry->d_name, grphint);
+ 	if (error == -ENOENT)
+ 		nfs_dentry_handle_enoent(dentry);
+ 	trace_nfs_remove_exit(dir, dentry, error);
++	put_group_info(grphint);
+ out:
+ 	return error;
+ }
+@@ -1915,6 +1989,7 @@ int nfs_symlink(struct inode *dir, struct dentry *dentry, const char *symname)
+ 	struct iattr attr;
+ 	unsigned int pathlen = strlen(symname);
+ 	int error;
++	struct group_info *grphint;
+ 
+ 	dfprintk(VFS, "NFS: symlink(%s/%lu, %pd, %s)\n", dir->i_sb->s_id,
+ 		dir->i_ino, dentry, symname);
+@@ -1935,9 +2010,18 @@ int nfs_symlink(struct inode *dir, struct dentry *dentry, const char *symname)
+ 		memset(kaddr + pathlen, 0, PAGE_SIZE - pathlen);
+ 	kunmap_atomic(kaddr);
+ 
++	grphint = groups_alloc(1);
++	if (grphint == NULL) {
++		__free_page(page);
++		return -ENOMEM;
++	}
++	GROUP_AT(grphint, 0) = dir->i_gid;
++
+ 	trace_nfs_symlink_enter(dir, dentry);
+-	error = NFS_PROTO(dir)->symlink(dir, dentry, page, pathlen, &attr);
++	error = NFS_PROTO(dir)->symlink(dir, dentry, page, pathlen, &attr,
++					grphint);
+ 	trace_nfs_symlink_exit(dir, dentry, error);
++	put_group_info(grphint);
+ 	if (error != 0) {
+ 		dfprintk(VFS, "NFS: symlink(%s/%lu, %pd, %s) error %d\n",
+ 			dir->i_sb->s_id, dir->i_ino,
+@@ -1972,20 +2056,27 @@ nfs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *dentry)
+ {
+ 	struct inode *inode = old_dentry->d_inode;
+ 	int error;
++	struct group_info *grphint;
+ 
+ 	dfprintk(VFS, "NFS: link(%pd2 -> %pd2)\n",
+ 		old_dentry, dentry);
+ 
++	grphint = groups_alloc(1);
++	if (grphint == NULL)
++		return -ENOMEM;
++	GROUP_AT(grphint, 0) = dir->i_gid;
++
+ 	trace_nfs_link_enter(inode, dir, dentry);
+ 	NFS_PROTO(inode)->return_delegation(inode);
+ 
+ 	d_drop(dentry);
+-	error = NFS_PROTO(dir)->link(inode, dir, &dentry->d_name);
++	error = NFS_PROTO(dir)->link(inode, dir, &dentry->d_name, grphint);
+ 	if (error == 0) {
+ 		ihold(inode);
+ 		d_add(dentry, inode);
+ 	}
+ 	trace_nfs_link_exit(inode, dir, dentry, error);
++	put_group_info(grphint);
+ 	return error;
+ }
+ EXPORT_SYMBOL_GPL(nfs_link);
+@@ -2408,6 +2499,7 @@ static int nfs_do_access(struct inode *inode, const struct cred *cred, int mask)
+ {
+ 	struct nfs_access_entry cache;
+ 	int status;
++	struct group_info *grphint;
+ 
+ 	trace_nfs_access_enter(inode);
+ 
+@@ -2421,11 +2513,19 @@ static int nfs_do_access(struct inode *inode, const struct cred *cred, int mask)
+ 	if (mask & MAY_NOT_BLOCK)
+ 		goto out;
+ 
++	grphint = groups_alloc(1);
++	if (grphint == NULL) {
++		status = -ENOMEM;
++		goto out;
++	}
++	GROUP_AT(grphint, 0) = inode->i_gid;
++
+ 	/* Be clever: ask server to check for all possible rights */
+ 	cache.mask = MAY_EXEC | MAY_WRITE | MAY_READ;
+ 	cache.cred = cred;
+ 	cache.jiffies = jiffies;
+-	status = NFS_PROTO(inode)->access(inode, &cache);
++	status = NFS_PROTO(inode)->access(inode, &cache, grphint);
++	put_group_info(grphint);
+ 	if (status != 0) {
+ 		if (status == -ESTALE) {
+ 			nfs_zap_caches(inode);
+diff --git a/bundle/fs/nfs/inode.c b/bundle/fs/nfs/inode.c
+index 3fc102ee8..636e4071c 100644
+--- a/bundle/fs/nfs/inode.c
++++ b/bundle/fs/nfs/inode.c
+@@ -514,6 +514,7 @@ nfs_setattr(struct dentry *dentry, struct iattr *attr)
+ 	struct inode *inode = dentry->d_inode;
+ 	struct nfs_fattr *fattr;
+ 	int error = 0;
++	struct group_info *grphint;
+ 
+ 	nfs_inc_stats(inode, NFSIOS_VFSSETATTR);
+ 
+@@ -549,14 +550,25 @@ nfs_setattr(struct dentry *dentry, struct iattr *attr)
+ 		goto out;
+ 	}
+ 
++	grphint = groups_alloc(attr->ia_valid & ATTR_GID ? 2 : 1);
++	if (grphint == NULL) {
++		error = -ENOMEM;
++		goto out_fattr;
++	}
++	GROUP_AT(grphint, 0) = inode->i_gid;		/* ATTR_SIZE */
++	if (attr->ia_valid & ATTR_GID)
++		GROUP_AT(grphint, 1) = attr->ia_gid;
++
+ 	/*
+ 	 * Return any delegations if we're going to change ACLs
+ 	 */
+ 	if ((attr->ia_valid & (ATTR_MODE|ATTR_UID|ATTR_GID)) != 0)
+ 		NFS_PROTO(inode)->return_delegation(inode);
+-	error = NFS_PROTO(inode)->setattr(dentry, fattr, attr);
++	error = NFS_PROTO(inode)->setattr(dentry, fattr, attr, grphint);
+ 	if (error == 0)
+ 		error = nfs_refresh_inode(inode, fattr);
++	put_group_info(grphint);
++out_fattr:
+ 	nfs_free_fattr(fattr);
+ out:
+ 	trace_nfs_setattr_exit(inode, error);
+@@ -818,15 +830,29 @@ struct nfs_open_context *alloc_nfs_open_context(struct dentry *dentry,
+ {
+ 	struct nfs_open_context *ctx;
+ 	const struct cred *cred = get_current_cred();
++	struct group_info *grphint = NULL;
++
++	if (d_inode(dentry)) {
++		grphint = groups_alloc(1);
++		if (grphint == NULL) {
++			put_cred(cred);
++			return ERR_PTR(-ENOMEM);
++		}
++		GROUP_AT(grphint, 0) = d_inode(dentry)->i_gid;
++	}
+ 
+ 	ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+ 	if (!ctx) {
+ 		put_cred(cred);
++		if (grphint)
++			put_group_info(grphint);
+ 		return ERR_PTR(-ENOMEM);
+ 	}
++
+ 	nfs_sb_active(dentry->d_sb);
+ 	ctx->dentry = dget(dentry);
+ 	ctx->cred = cred;
++	ctx->grphint = grphint;
+ 	ctx->ll_cred = NULL;
+ 	ctx->state = NULL;
+ 	ctx->mode = f_mode;
+@@ -864,6 +890,8 @@ static void __put_nfs_open_context(struct nfs_open_context *ctx, int is_sync)
+ 	if (inode != NULL)
+ 		NFS_PROTO(inode)->close_context(ctx, is_sync);
+ 	put_cred(ctx->cred);
++	if (ctx->grphint)
++		put_group_info(ctx->grphint);
+ 	dput(ctx->dentry);
+ 	nfs_sb_deactive(sb);
+ 	put_rpccred(ctx->ll_cred);
+diff --git a/bundle/fs/nfs/namespace.c b/bundle/fs/nfs/namespace.c
+index 23e89bf3e..d1860fa6c 100644
+--- a/bundle/fs/nfs/namespace.c
++++ b/bundle/fs/nfs/namespace.c
+@@ -277,9 +277,17 @@ struct vfsmount *nfs_submount(struct nfs_server *server, struct dentry *dentry,
+ {
+ 	int err;
+ 	struct dentry *parent = dget_parent(dentry);
++	struct group_info *grphint;
++
++	grphint = groups_alloc(1);
++	if (grphint == NULL) {
++		dput(parent);
++		return ERR_PTR(-ENOMEM);
++	}
++	GROUP_AT(grphint, 0) = d_inode(parent)->i_gid;
+ 
+ 	/* Look it up again to get its attributes */
+-	err = server->nfs_client->rpc_ops->lookup(parent->d_inode, &dentry->d_name, fh, fattr, NULL);
++	err = server->nfs_client->rpc_ops->lookup(parent->d_inode, &dentry->d_name, fh, fattr, NULL, grphint);
+ 	dput(parent);
+ 	if (err != 0)
+ 		return ERR_PTR(err);
+diff --git a/bundle/fs/nfs/nfs3proc.c b/bundle/fs/nfs/nfs3proc.c
+index 17a82e770..28bf5b70a 100644
+--- a/bundle/fs/nfs/nfs3proc.c
++++ b/bundle/fs/nfs/nfs3proc.c
+@@ -121,7 +121,7 @@ nfs3_proc_getattr(struct nfs_server *server, struct nfs_fh *fhandle,
+ 
+ static int
+ nfs3_proc_setattr(struct dentry *dentry, struct nfs_fattr *fattr,
+-			struct iattr *sattr)
++			struct iattr *sattr, struct group_info *grphint)
+ {
+ 	struct inode *inode = dentry->d_inode;
+ 	struct nfs3_sattrargs	arg = {
+@@ -138,6 +138,9 @@ nfs3_proc_setattr(struct dentry *dentry, struct nfs_fattr *fattr,
+ 	dprintk("NFS call  setattr\n");
+ 	if (sattr->ia_valid & ATTR_FILE)
+ 		msg.rpc_cred = nfs_file_cred(sattr->ia_file);
++	else
++		/* truncate() requires write access */
++		msg.rpc_grphint = grphint;
+ 	nfs_fattr_init(fattr);
+ 	status = rpc_call_sync_multipath(NFS_CLIENT(inode), &msg, 0, NFS_FH_HASH_INODE(inode));
+ 	if (status == 0)
+@@ -149,7 +152,7 @@ nfs3_proc_setattr(struct dentry *dentry, struct nfs_fattr *fattr,
+ static int
+ nfs3_proc_lookup(struct inode *dir, struct qstr *name,
+ 		 struct nfs_fh *fhandle, struct nfs_fattr *fattr,
+-		 struct nfs4_label *label)
++		 struct nfs4_label *label, struct group_info *grphint)
+ {
+ 	struct nfs3_diropargs	arg = {
+ 		.fh		= NFS_FH(dir),
+@@ -164,6 +167,7 @@ nfs3_proc_lookup(struct inode *dir, struct qstr *name,
+ 		.rpc_proc	= &nfs3_procedures[NFS3PROC_LOOKUP],
+ 		.rpc_argp	= &arg,
+ 		.rpc_resp	= &res,
++		.rpc_grphint	= grphint,
+ 	};
+ 	int			status;
+ 
+@@ -186,7 +190,8 @@ nfs3_proc_lookup(struct inode *dir, struct qstr *name,
+ 	return status;
+ }
+ 
+-static int nfs3_proc_access(struct inode *inode, struct nfs_access_entry *entry)
++static int nfs3_proc_access(struct inode *inode, struct nfs_access_entry *entry,
++			    struct group_info *grphint)
+ {
+ 	struct nfs3_accessargs	arg = {
+ 		.fh		= NFS_FH(inode),
+@@ -197,6 +202,7 @@ static int nfs3_proc_access(struct inode *inode, struct nfs_access_entry *entry)
+ 		.rpc_argp	= &arg,
+ 		.rpc_resp	= &res,
+ 		.rpc_cred	= entry->cred,
++		.rpc_grphint	= grphint,
+ 	};
+ 	int mode = entry->mask;
+ 	int status = -ENOMEM;
+@@ -306,7 +312,8 @@ static int nfs3_do_create(struct inode *dir, struct dentry *dentry, struct nfs3_
+ 	status = rpc_call_sync_multipath(NFS_CLIENT(dir), &data->msg, 0, NFS_FH_HASH_INODE(dir));
+ 	nfs_post_op_update_inode(dir, data->res.dir_attr);
+ 	if (status == 0)
+-		status = nfs_instantiate(dentry, data->res.fh, data->res.fattr, NULL);
++		status = nfs_instantiate(dentry, data->res.fh, data->res.fattr, NULL,
++					 data->msg.rpc_grphint);
+ 	return status;
+ }
+ 
+@@ -320,7 +327,7 @@ static void nfs3_free_createdata(struct nfs3_createdata *data)
+  */
+ static int
+ nfs3_proc_create(struct inode *dir, struct dentry *dentry, struct iattr *sattr,
+-		 int flags)
++		 int flags, struct group_info *grphint)
+ {
+ 	struct nfs3_createdata *data;
+ 	umode_t mode = sattr->ia_mode;
+@@ -333,6 +340,7 @@ nfs3_proc_create(struct inode *dir, struct dentry *dentry, struct iattr *sattr,
+ 		goto out;
+ 
+ 	data->msg.rpc_proc = &nfs3_procedures[NFS3PROC_CREATE];
++	data->msg.rpc_grphint = grphint;
+ 	data->arg.create.fh = NFS_FH(dir);
+ 	data->arg.create.name = dentry->d_name.name;
+ 	data->arg.create.len = dentry->d_name.len;
+@@ -386,7 +394,7 @@ nfs3_proc_create(struct inode *dir, struct dentry *dentry, struct iattr *sattr,
+ 		/* Note: we could use a guarded setattr here, but I'm
+ 		 * not sure this buys us anything (and I'd have
+ 		 * to revamp the NFSv3 XDR code) */
+-		status = nfs3_proc_setattr(dentry, data->res.fattr, sattr);
++		status = nfs3_proc_setattr(dentry, data->res.fattr, sattr, NULL);
+ 		nfs_post_op_update_inode(dentry->d_inode, data->res.fattr);
+ 		dprintk("NFS reply setattr (post-create): %d\n", status);
+ 		if (status != 0)
+@@ -400,7 +408,8 @@ out:
+ }
+ 
+ static int
+-nfs3_proc_remove(struct inode *dir, struct qstr *name)
++nfs3_proc_remove(struct inode *dir, struct qstr *name,
++		 struct group_info *grphint)
+ {
+ 	struct nfs_removeargs arg = {
+ 		.fh = NFS_FH(dir),
+@@ -411,6 +420,7 @@ nfs3_proc_remove(struct inode *dir, struct qstr *name)
+ 		.rpc_proc = &nfs3_procedures[NFS3PROC_REMOVE],
+ 		.rpc_argp = &arg,
+ 		.rpc_resp = &res,
++		.rpc_grphint = grphint,
+ 	};
+ 	int status = -ENOMEM;
+ 
+@@ -476,7 +486,8 @@ nfs3_proc_rename_done(struct rpc_task *task, struct inode *old_dir,
+ }
+ 
+ static int
+-nfs3_proc_link(struct inode *inode, struct inode *dir, struct qstr *name)
++nfs3_proc_link(struct inode *inode, struct inode *dir, struct qstr *name,
++	       struct group_info *grphint)
+ {
+ 	struct nfs3_linkargs	arg = {
+ 		.fromfh		= NFS_FH(inode),
+@@ -489,6 +500,7 @@ nfs3_proc_link(struct inode *inode, struct inode *dir, struct qstr *name)
+ 		.rpc_proc	= &nfs3_procedures[NFS3PROC_LINK],
+ 		.rpc_argp	= &arg,
+ 		.rpc_resp	= &res,
++		.rpc_grphint	= grphint,
+ 	};
+ 	int status = -ENOMEM;
+ 
+@@ -510,7 +522,8 @@ out:
+ 
+ static int
+ nfs3_proc_symlink(struct inode *dir, struct dentry *dentry, struct page *page,
+-		  unsigned int len, struct iattr *sattr)
++		  unsigned int len, struct iattr *sattr,
++		  struct group_info *grphint)
+ {
+ 	struct nfs3_createdata *data;
+ 	int status = -ENOMEM;
+@@ -524,6 +537,7 @@ nfs3_proc_symlink(struct inode *dir, struct dentry *dentry, struct page *page,
+ 	if (data == NULL)
+ 		goto out;
+ 	data->msg.rpc_proc = &nfs3_procedures[NFS3PROC_SYMLINK];
++	data->msg.rpc_grphint = grphint;
+ 	data->arg.symlink.fromfh = NFS_FH(dir);
+ 	data->arg.symlink.fromname = dentry->d_name.name;
+ 	data->arg.symlink.fromlen = dentry->d_name.len;
+@@ -540,7 +554,8 @@ out:
+ }
+ 
+ static int
+-nfs3_proc_mkdir(struct inode *dir, struct dentry *dentry, struct iattr *sattr)
++nfs3_proc_mkdir(struct inode *dir, struct dentry *dentry, struct iattr *sattr,
++		struct group_info *grphint)
+ {
+ 	struct nfs3_createdata *data;
+ 	umode_t mode = sattr->ia_mode;
+@@ -555,6 +570,7 @@ nfs3_proc_mkdir(struct inode *dir, struct dentry *dentry, struct iattr *sattr)
+ 		goto out;
+ 
+ 	data->msg.rpc_proc = &nfs3_procedures[NFS3PROC_MKDIR];
++	data->msg.rpc_grphint = grphint;
+ 	data->arg.mkdir.fh = NFS_FH(dir);
+ 	data->arg.mkdir.name = dentry->d_name.name;
+ 	data->arg.mkdir.len = dentry->d_name.len;
+@@ -572,7 +588,8 @@ out:
+ }
+ 
+ static int
+-nfs3_proc_rmdir(struct inode *dir, struct qstr *name)
++nfs3_proc_rmdir(struct inode *dir, struct qstr *name,
++		struct group_info *grphint)
+ {
+ 	struct nfs_fattr	*dir_attr;
+ 	struct nfs3_diropargs	arg = {
+@@ -583,6 +600,7 @@ nfs3_proc_rmdir(struct inode *dir, struct qstr *name)
+ 	struct rpc_message msg = {
+ 		.rpc_proc	= &nfs3_procedures[NFS3PROC_RMDIR],
+ 		.rpc_argp	= &arg,
++		.rpc_grphint	= grphint,
+ 	};
+ 	int status = -ENOMEM;
+ 
+@@ -611,7 +629,8 @@ out:
+  */
+ static int
+ nfs3_proc_readdir(struct dentry *dentry, const struct cred *cred,
+-		  u64 cookie, struct page **pages, unsigned int count, int plus)
++		  u64 cookie, struct page **pages, unsigned int count, int plus,
++		  struct group_info *grphint)
+ {
+ 	struct inode		*dir = dentry->d_inode;
+ 	__be32			*verf = NFS_I(dir)->cookieverf;
+@@ -632,6 +651,7 @@ nfs3_proc_readdir(struct dentry *dentry, const struct cred *cred,
+ 		.rpc_argp	= &arg,
+ 		.rpc_resp	= &res,
+ 		.rpc_cred	= cred,
++		.rpc_grphint	= grphint,
+ 	};
+ 	int status = -ENOMEM;
+ 
+@@ -659,7 +679,7 @@ out:
+ 
+ static int
+ nfs3_proc_mknod(struct inode *dir, struct dentry *dentry, struct iattr *sattr,
+-		dev_t rdev)
++		dev_t rdev, struct group_info *grphint)
+ {
+ 	struct nfs3_createdata *data;
+ 	umode_t mode = sattr->ia_mode;
+@@ -675,6 +695,7 @@ nfs3_proc_mknod(struct inode *dir, struct dentry *dentry, struct iattr *sattr,
+ 		goto out;
+ 
+ 	data->msg.rpc_proc = &nfs3_procedures[NFS3PROC_MKNOD];
++	data->msg.rpc_grphint = grphint;
+ 	data->arg.mknod.fh = NFS_FH(dir);
+ 	data->arg.mknod.name = dentry->d_name.name;
+ 	data->arg.mknod.len = dentry->d_name.len;
+diff --git a/bundle/fs/nfs/nfs4proc.c b/bundle/fs/nfs/nfs4proc.c
+index 6838f97ca..d7929b0b9 100644
+--- a/bundle/fs/nfs/nfs4proc.c
++++ b/bundle/fs/nfs/nfs4proc.c
+@@ -3842,7 +3842,7 @@ static int nfs4_proc_getattr(struct nfs_server *server, struct nfs_fh *fhandle,
+  */
+ static int
+ nfs4_proc_setattr(struct dentry *dentry, struct nfs_fattr *fattr,
+-		  struct iattr *sattr)
++		  struct iattr *sattr, struct group_info *grphint)
+ {
+ 	struct inode *inode = dentry->d_inode;
+ 	const struct cred *cred = NULL;
+@@ -3972,7 +3972,8 @@ out:
+ 
+ static int nfs4_proc_lookup(struct inode *dir, struct qstr *name,
+ 			    struct nfs_fh *fhandle, struct nfs_fattr *fattr,
+-			    struct nfs4_label *label)
++			    struct nfs4_label *label,
++			    struct group_info *grphint)
+ {
+ 	int status;
+ 	struct rpc_clnt *client = NFS_CLIENT(dir);
+@@ -4047,7 +4048,8 @@ static int _nfs4_proc_access(struct inode *inode, struct nfs_access_entry *entry
+ 	return status;
+ }
+ 
+-static int nfs4_proc_access(struct inode *inode, struct nfs_access_entry *entry)
++static int nfs4_proc_access(struct inode *inode, struct nfs_access_entry *entry,
++			    struct group_info *grphint)
+ {
+ 	struct nfs4_exception exception = { };
+ 	int err;
+@@ -4120,7 +4122,7 @@ static int nfs4_proc_readlink(struct inode *inode, struct page *page,
+  */
+ static int
+ nfs4_proc_create(struct inode *dir, struct dentry *dentry, struct iattr *sattr,
+-		 int flags)
++		 int flags, struct group_info *grphint)
+ {
+ 	struct nfs_server *server = NFS_SERVER(dir);
+ 	struct nfs4_label l, *ilabel = NULL;
+@@ -4170,7 +4172,8 @@ static int _nfs4_proc_remove(struct inode *dir, struct qstr *name)
+ 	return status;
+ }
+ 
+-static int nfs4_proc_remove(struct inode *dir, struct qstr *name)
++static int nfs4_proc_remove(struct inode *dir, struct qstr *name,
++			    struct group_info *grphint)
+ {
+ 	struct nfs4_exception exception = { };
+ 	int err;
+@@ -4300,7 +4303,8 @@ out:
+ 	return status;
+ }
+ 
+-static int nfs4_proc_link(struct inode *inode, struct inode *dir, struct qstr *name)
++static int nfs4_proc_link(struct inode *inode, struct inode *dir, struct qstr *name,
++			  struct group_info *grphint)
+ {
+ 	struct nfs4_exception exception = { };
+ 	int err;
+@@ -4362,7 +4366,7 @@ static int nfs4_do_create(struct inode *dir, struct dentry *dentry, struct nfs4_
+ 				    &data->arg.seq_args, &data->res.seq_res, 1);
+ 	if (status == 0) {
+ 		update_changeattr(dir, &data->res.dir_cinfo);
+-		status = nfs_instantiate(dentry, data->res.fh, data->res.fattr, data->res.label);
++		status = nfs_instantiate(dentry, data->res.fh, data->res.fattr, data->res.label, NULL);
+ 	}
+ 	return status;
+ }
+@@ -4401,7 +4405,8 @@ out:
+ }
+ 
+ static int nfs4_proc_symlink(struct inode *dir, struct dentry *dentry,
+-		struct page *page, unsigned int len, struct iattr *sattr)
++		struct page *page, unsigned int len, struct iattr *sattr,
++		struct group_info *grphint)
+ {
+ 	struct nfs4_exception exception = { };
+ 	struct nfs4_label l, *label = NULL;
+@@ -4439,7 +4444,7 @@ out:
+ }
+ 
+ static int nfs4_proc_mkdir(struct inode *dir, struct dentry *dentry,
+-		struct iattr *sattr)
++		struct iattr *sattr, struct group_info *grphint)
+ {
+ 	struct nfs_server *server = NFS_SERVER(dir);
+ 	struct nfs4_exception exception = { };
+@@ -4500,7 +4505,8 @@ static int _nfs4_proc_readdir(struct dentry *dentry, const struct cred *cred,
+ }
+ 
+ static int nfs4_proc_readdir(struct dentry *dentry, const struct cred *cred,
+-		u64 cookie, struct page **pages, unsigned int count, int plus)
++		u64 cookie, struct page **pages, unsigned int count, int plus,
++		struct group_info *grphint)
+ {
+ 	struct nfs4_exception exception = { };
+ 	int err;
+@@ -4550,7 +4556,7 @@ out:
+ }
+ 
+ static int nfs4_proc_mknod(struct inode *dir, struct dentry *dentry,
+-		struct iattr *sattr, dev_t rdev)
++		struct iattr *sattr, dev_t rdev, struct group_info *grphint)
+ {
+ 	struct nfs_server *server = NFS_SERVER(dir);
+ 	struct nfs4_exception exception = { };
+diff --git a/bundle/fs/nfs/pagelist.c b/bundle/fs/nfs/pagelist.c
+index 35318d258..1efda07b2 100644
+--- a/bundle/fs/nfs/pagelist.c
++++ b/bundle/fs/nfs/pagelist.c
+@@ -48,6 +48,7 @@ void nfs_pgheader_init(struct nfs_pageio_descriptor *desc,
+ 	hdr->req = nfs_list_entry(mirror->pg_list.next);
+ 	hdr->inode = desc->pg_inode;
+ 	hdr->cred = hdr->req->wb_context->cred;
++	hdr->grphint = hdr->req->wb_context->grphint;
+ 	hdr->io_start = req_offset(hdr->req);
+ 	hdr->good_bytes = mirror->pg_count;
+ 	hdr->dreq = desc->pg_dreq;
+@@ -609,6 +610,7 @@ int nfs_initiate_pgio(struct rpc_clnt *clnt, struct nfs_pgio_header *hdr,
+ 		.rpc_argp = &hdr->args,
+ 		.rpc_resp = &hdr->res,
+ 		.rpc_cred = cred,
++		.rpc_grphint = hdr->grphint,
+ 	};
+ 	struct rpc_task_setup task_setup_data = {
+ 		.rpc_client = clnt,
+diff --git a/bundle/fs/nfs/proc.c b/bundle/fs/nfs/proc.c
+index f28149cd0..e0721f0a5 100644
+--- a/bundle/fs/nfs/proc.c
++++ b/bundle/fs/nfs/proc.c
+@@ -116,7 +116,7 @@ nfs_proc_getattr(struct nfs_server *server, struct nfs_fh *fhandle,
+ 
+ static int
+ nfs_proc_setattr(struct dentry *dentry, struct nfs_fattr *fattr,
+-		 struct iattr *sattr)
++		 struct iattr *sattr, struct group_info *grphint)
+ {
+ 	struct inode *inode = dentry->d_inode;
+ 	struct nfs_sattrargs	arg = { 
+@@ -136,6 +136,9 @@ nfs_proc_setattr(struct dentry *dentry, struct nfs_fattr *fattr,
+ 	dprintk("NFS call  setattr\n");
+ 	if (sattr->ia_valid & ATTR_FILE)
+ 		msg.rpc_cred = nfs_file_cred(sattr->ia_file);
++	else
++		/* truncate() requires write access */
++		msg.rpc_grphint = grphint;
+ 	nfs_fattr_init(fattr);
+ 	status = rpc_call_sync(NFS_CLIENT(inode), &msg, 0);
+ 	if (status == 0)
+@@ -147,7 +150,7 @@ nfs_proc_setattr(struct dentry *dentry, struct nfs_fattr *fattr,
+ static int
+ nfs_proc_lookup(struct inode *dir, struct qstr *name,
+ 		struct nfs_fh *fhandle, struct nfs_fattr *fattr,
+-		struct nfs4_label *label)
++		struct nfs4_label *label, struct group_info *grphint)
+ {
+ 	struct nfs_diropargs	arg = {
+ 		.fh		= NFS_FH(dir),
+@@ -162,6 +165,7 @@ nfs_proc_lookup(struct inode *dir, struct qstr *name,
+ 		.rpc_proc	= &nfs_procedures[NFSPROC_LOOKUP],
+ 		.rpc_argp	= &arg,
+ 		.rpc_resp	= &res,
++		.rpc_grphint	= grphint,
+ 	};
+ 	int			status;
+ 
+@@ -227,11 +231,12 @@ static void nfs_free_createdata(const struct nfs_createdata *data)
+ 
+ static int
+ nfs_proc_create(struct inode *dir, struct dentry *dentry, struct iattr *sattr,
+-		int flags)
++		int flags, struct group_info *grphint)
+ {
+ 	struct nfs_createdata *data;
+ 	struct rpc_message msg = {
+ 		.rpc_proc	= &nfs_procedures[NFSPROC_CREATE],
++		.rpc_grphint	= grphint,
+ 	};
+ 	int status = -ENOMEM;
+ 
+@@ -244,7 +249,7 @@ nfs_proc_create(struct inode *dir, struct dentry *dentry, struct iattr *sattr,
+ 	status = rpc_call_sync(NFS_CLIENT(dir), &msg, 0);
+ 	nfs_mark_for_revalidate(dir);
+ 	if (status == 0)
+-		status = nfs_instantiate(dentry, data->res.fh, data->res.fattr, NULL);
++		status = nfs_instantiate(dentry, data->res.fh, data->res.fattr, NULL, grphint);
+ 	nfs_free_createdata(data);
+ out:
+ 	dprintk("NFS reply create: %d\n", status);
+@@ -256,11 +261,12 @@ out:
+  */
+ static int
+ nfs_proc_mknod(struct inode *dir, struct dentry *dentry, struct iattr *sattr,
+-	       dev_t rdev)
++	       dev_t rdev, struct group_info *grphint)
+ {
+ 	struct nfs_createdata *data;
+ 	struct rpc_message msg = {
+ 		.rpc_proc	= &nfs_procedures[NFSPROC_CREATE],
++		.rpc_grphint	= grphint,
+ 	};
+ 	umode_t mode;
+ 	int status = -ENOMEM;
+@@ -291,7 +297,7 @@ nfs_proc_mknod(struct inode *dir, struct dentry *dentry, struct iattr *sattr,
+ 		status = rpc_call_sync(NFS_CLIENT(dir), &msg, 0);
+ 	}
+ 	if (status == 0)
+-		status = nfs_instantiate(dentry, data->res.fh, data->res.fattr, NULL);
++		status = nfs_instantiate(dentry, data->res.fh, data->res.fattr, NULL, grphint);
+ 	nfs_free_createdata(data);
+ out:
+ 	dprintk("NFS reply mknod: %d\n", status);
+@@ -299,7 +305,8 @@ out:
+ }
+   
+ static int
+-nfs_proc_remove(struct inode *dir, struct qstr *name)
++nfs_proc_remove(struct inode *dir, struct qstr *name,
++		struct group_info *grphint)
+ {
+ 	struct nfs_removeargs arg = {
+ 		.fh = NFS_FH(dir),
+@@ -308,6 +315,7 @@ nfs_proc_remove(struct inode *dir, struct qstr *name)
+ 	struct rpc_message msg = { 
+ 		.rpc_proc = &nfs_procedures[NFSPROC_REMOVE],
+ 		.rpc_argp = &arg,
++		.rpc_grphint = grphint,
+ 	};
+ 	int			status;
+ 
+@@ -357,7 +365,8 @@ nfs_proc_rename_done(struct rpc_task *task, struct inode *old_dir,
+ }
+ 
+ static int
+-nfs_proc_link(struct inode *inode, struct inode *dir, struct qstr *name)
++nfs_proc_link(struct inode *inode, struct inode *dir, struct qstr *name,
++	      struct group_info *grphint)
+ {
+ 	struct nfs_linkargs	arg = {
+ 		.fromfh		= NFS_FH(inode),
+@@ -368,6 +377,7 @@ nfs_proc_link(struct inode *inode, struct inode *dir, struct qstr *name)
+ 	struct rpc_message msg = {
+ 		.rpc_proc	= &nfs_procedures[NFSPROC_LINK],
+ 		.rpc_argp	= &arg,
++		.rpc_grphint	= grphint,
+ 	};
+ 	int			status;
+ 
+@@ -381,7 +391,8 @@ nfs_proc_link(struct inode *inode, struct inode *dir, struct qstr *name)
+ 
+ static int
+ nfs_proc_symlink(struct inode *dir, struct dentry *dentry, struct page *page,
+-		 unsigned int len, struct iattr *sattr)
++		 unsigned int len, struct iattr *sattr,
++		 struct group_info *grphint)
+ {
+ 	struct nfs_fh *fh;
+ 	struct nfs_fattr *fattr;
+@@ -396,6 +407,7 @@ nfs_proc_symlink(struct inode *dir, struct dentry *dentry, struct page *page,
+ 	struct rpc_message msg = {
+ 		.rpc_proc	= &nfs_procedures[NFSPROC_SYMLINK],
+ 		.rpc_argp	= &arg,
++		.rpc_grphint	= grphint,
+ 	};
+ 	int status = -ENAMETOOLONG;
+ 
+@@ -419,7 +431,7 @@ nfs_proc_symlink(struct inode *dir, struct dentry *dentry, struct page *page,
+ 	 * should fill in the data with a LOOKUP call on the wire.
+ 	 */
+ 	if (status == 0)
+-		status = nfs_instantiate(dentry, fh, fattr, NULL);
++		status = nfs_instantiate(dentry, fh, fattr, NULL, grphint);
+ 
+ out_free:
+ 	nfs_free_fattr(fattr);
+@@ -430,11 +442,13 @@ out:
+ }
+ 
+ static int
+-nfs_proc_mkdir(struct inode *dir, struct dentry *dentry, struct iattr *sattr)
++nfs_proc_mkdir(struct inode *dir, struct dentry *dentry, struct iattr *sattr,
++	       struct group_info *grphint)
+ {
+ 	struct nfs_createdata *data;
+ 	struct rpc_message msg = {
+ 		.rpc_proc	= &nfs_procedures[NFSPROC_MKDIR],
++		.rpc_grphint	= grphint,
+ 	};
+ 	int status = -ENOMEM;
+ 
+@@ -448,7 +462,7 @@ nfs_proc_mkdir(struct inode *dir, struct dentry *dentry, struct iattr *sattr)
+ 	status = rpc_call_sync(NFS_CLIENT(dir), &msg, 0);
+ 	nfs_mark_for_revalidate(dir);
+ 	if (status == 0)
+-		status = nfs_instantiate(dentry, data->res.fh, data->res.fattr, NULL);
++		status = nfs_instantiate(dentry, data->res.fh, data->res.fattr, NULL, grphint);
+ 	nfs_free_createdata(data);
+ out:
+ 	dprintk("NFS reply mkdir: %d\n", status);
+@@ -456,7 +470,8 @@ out:
+ }
+ 
+ static int
+-nfs_proc_rmdir(struct inode *dir, struct qstr *name)
++nfs_proc_rmdir(struct inode *dir, struct qstr *name,
++	       struct group_info *grphint)
+ {
+ 	struct nfs_diropargs	arg = {
+ 		.fh		= NFS_FH(dir),
+@@ -466,6 +481,7 @@ nfs_proc_rmdir(struct inode *dir, struct qstr *name)
+ 	struct rpc_message msg = {
+ 		.rpc_proc	= &nfs_procedures[NFSPROC_RMDIR],
+ 		.rpc_argp	= &arg,
++		.rpc_grphint	= grphint,
+ 	};
+ 	int			status;
+ 
+@@ -485,7 +501,8 @@ nfs_proc_rmdir(struct inode *dir, struct qstr *name)
+  */
+ static int
+ nfs_proc_readdir(struct dentry *dentry, const struct cred *cred,
+-		 u64 cookie, struct page **pages, unsigned int count, int plus)
++		 u64 cookie, struct page **pages, unsigned int count, int plus,
++		 struct group_info *grphint)
+ {
+ 	struct inode		*dir = dentry->d_inode;
+ 	struct nfs_readdirargs	arg = {
+@@ -498,6 +515,7 @@ nfs_proc_readdir(struct dentry *dentry, const struct cred *cred,
+ 		.rpc_proc	= &nfs_procedures[NFSPROC_READDIR],
+ 		.rpc_argp	= &arg,
+ 		.rpc_cred	= cred,
++		.rpc_grphint	= grphint,
+ 	};
+ 	int			status;
+ 
+diff --git a/bundle/fs/nfs/unlink.c b/bundle/fs/nfs/unlink.c
+index b4790d8ee..4ed9d6f73 100644
+--- a/bundle/fs/nfs/unlink.c
++++ b/bundle/fs/nfs/unlink.c
+@@ -33,6 +33,8 @@ nfs_free_unlinkdata(struct nfs_unlinkdata *data)
+ {
+ 	iput(data->dir);
+ 	put_cred(data->cred);
++	put_group_info(data->grphint);
++	
+ 	kfree(data->args.name.name);
+ 	kfree(data);
+ }
+@@ -121,6 +123,7 @@ static int nfs_do_call_unlink(struct dentry *parent, struct inode *dir, struct n
+ 		.rpc_argp = &data->args,
+ 		.rpc_resp = &data->res,
+ 		.rpc_cred = data->cred,
++		.rpc_grphint = data->grphint,
+ 	};
+ 	struct rpc_task_setup task_setup_data = {
+ 		.rpc_message = &msg,
+@@ -256,12 +259,19 @@ nfs_async_unlink(struct inode *dir, struct dentry *dentry)
+ 	struct nfs_unlinkdata *data;
+ 	int status = -ENOMEM;
+ 	void *devname_garbage = NULL;
++	struct group_info *grphint;
++
++	grphint = groups_alloc(1);
++	if (grphint == NULL)
++		goto out;
++	GROUP_AT(grphint, 0) = dentry->d_parent->d_inode->i_gid;
+ 
+ 	data = kzalloc(sizeof(*data), GFP_KERNEL);
+ 	if (data == NULL)
+-		goto out;
++		goto out_grphint;
+ 
+ 	data->cred = get_current_cred();
++	data->grphint = grphint;
+ 	data->res.dir_attr = &data->dir_attr;
+ 
+ 	status = -EBUSY;
+@@ -283,6 +293,8 @@ out_unlock:
+ 	spin_unlock(&dentry->d_lock);
+ 	put_cred(data->cred);
+ 	kfree(data);
++out_grphint:
++	put_group_info(grphint);
+ out:
+ 	return status;
+ }
+@@ -386,6 +398,7 @@ static void nfs_async_rename_release(void *calldata)
+ 	iput(data->new_dir);
+ 	nfs_sb_deactive(sb);
+ 	put_cred(data->cred);
++	put_group_info(data->grphint);
+ 	kfree(data);
+ }
+ 
+@@ -431,6 +444,14 @@ nfs_async_rename(struct inode *old_dir, struct inode *new_dir,
+ 		return ERR_PTR(-ENOMEM);
+ 	task_setup_data.callback_data = data;
+ 
++	data->grphint = groups_alloc(2);
++	if (data->grphint == NULL) {
++		kfree(data);
++		return ERR_PTR(-ENOMEM);
++	}
++	GROUP_AT(data->grphint, 0) = old_dir->i_gid;
++	GROUP_AT(data->grphint, 1) = new_dir->i_gid;
++
+ 	data->cred = get_current_cred();
+ 	if (IS_ERR(data->cred)) {
+ 		struct rpc_task *task = ERR_CAST(data->cred);
+@@ -441,6 +462,7 @@ nfs_async_rename(struct inode *old_dir, struct inode *new_dir,
+ 	msg.rpc_argp = &data->args;
+ 	msg.rpc_resp = &data->res;
+ 	msg.rpc_cred = data->cred;
++	msg.rpc_grphint = data->grphint;
+ 
+ 	/* set up nfs_renamedata */
+ 	data->old_dir = old_dir;
+diff --git a/bundle/include/linux/nfs_fs.h b/bundle/include/linux/nfs_fs.h
+index 1845be40f..2e38730c6 100644
+--- a/bundle/include/linux/nfs_fs.h
++++ b/bundle/include/linux/nfs_fs.h
+@@ -69,6 +69,7 @@ struct nfs_open_context {
+ 	fl_owner_t flock_owner;
+ 	struct dentry *dentry;
+ 	const struct cred *cred;
++	struct group_info *grphint;
+ 	struct rpc_cred *ll_cred;	/* low-level cred - use to check for expiry */
+ 	struct nfs4_state *state;
+ 	fmode_t mode;
+@@ -87,6 +88,7 @@ struct nfs_open_context {
+ struct nfs_open_dir_context {
+ 	struct list_head list;
+ 	const struct cred *cred;
++	struct group_info *grphint;
+ 	unsigned long attr_gencount;
+ 	__u64 dir_cookie;
+ 	__u64 dup_cookie;
+@@ -470,7 +472,8 @@ extern const struct dentry_operations nfs_dentry_operations;
+ 
+ extern void nfs_force_lookup_revalidate(struct inode *dir);
+ extern int nfs_instantiate(struct dentry *dentry, struct nfs_fh *fh,
+-			struct nfs_fattr *fattr, struct nfs4_label *label);
++			struct nfs_fattr *fattr, struct nfs4_label *label,
++			struct group_info *grphint);
+ extern int nfs_may_open(struct inode *inode, const struct cred *cred, int openflags);
+ extern void nfs_access_zap_cache(struct inode *inode);
+ 
+diff --git a/bundle/include/linux/nfs_xdr.h b/bundle/include/linux/nfs_xdr.h
+index 90cf3c15d..fd5d0577f 100644
+--- a/bundle/include/linux/nfs_xdr.h
++++ b/bundle/include/linux/nfs_xdr.h
+@@ -1439,6 +1439,7 @@ enum {
+ struct nfs_pgio_header {
+ 	struct inode		*inode;
+ 	const struct cred		*cred;
++	struct group_info	*grphint;
+ 	struct list_head	pages;
+ 	struct nfs_page		*req;
+ 	struct nfs_writeverf	verf;		/* Used for writes */
+@@ -1531,6 +1532,7 @@ struct nfs_unlinkdata {
+ 	struct nfs_removeres res;
+ 	struct inode *dir;
+ 	const struct cred *cred;
++	struct group_info *grphint;
+ 	struct nfs_fattr dir_attr;
+ 	long timeout;
+ };
+@@ -1539,6 +1541,7 @@ struct nfs_renamedata {
+ 	struct nfs_renameargs	args;
+ 	struct nfs_renameres	res;
+ 	const struct cred	*cred;
++	struct group_info	*grphint;
+ 	struct inode		*old_dir;
+ 	struct dentry		*old_dentry;
+ 	struct nfs_fattr	old_fattr;
+@@ -1578,31 +1581,37 @@ struct nfs_rpc_ops {
+ 	int	(*getattr) (struct nfs_server *, struct nfs_fh *,
+ 			    struct nfs_fattr *, struct nfs4_label *);
+ 	int	(*setattr) (struct dentry *, struct nfs_fattr *,
+-			    struct iattr *);
++			    struct iattr *, struct group_info *);
+ 	int	(*lookup)  (struct inode *, struct qstr *,
+ 			    struct nfs_fh *, struct nfs_fattr *,
+-			    struct nfs4_label *);
+-	int	(*access)  (struct inode *, struct nfs_access_entry *);
++			    struct nfs4_label *, struct group_info *);
++	int	(*access)  (struct inode *, struct nfs_access_entry *,
++			    struct group_info *);
+ 	int	(*readlink)(struct inode *, struct page *, unsigned int,
+ 			    unsigned int);
+ 	int	(*create)  (struct inode *, struct dentry *,
+-			    struct iattr *, int);
+-	int	(*remove)  (struct inode *, struct qstr *);
++			    struct iattr *, int, struct group_info *);
++	int	(*remove)  (struct inode *, struct qstr *,
++			    struct group_info *);
+ 	void	(*unlink_setup)  (struct rpc_message *, struct inode *dir);
+ 	void	(*unlink_rpc_prepare) (struct rpc_task *, struct nfs_unlinkdata *);
+ 	int	(*unlink_done) (struct rpc_task *, struct inode *);
+ 	void	(*rename_setup)  (struct rpc_message *msg, struct inode *dir);
+ 	void	(*rename_rpc_prepare)(struct rpc_task *task, struct nfs_renamedata *);
+ 	int	(*rename_done) (struct rpc_task *task, struct inode *old_dir, struct inode *new_dir);
+-	int	(*link)    (struct inode *, struct inode *, struct qstr *);
++	int	(*link)    (struct inode *, struct inode *, struct qstr *,
++			    struct group_info *);
+ 	int	(*symlink) (struct inode *, struct dentry *, struct page *,
+-			    unsigned int, struct iattr *);
+-	int	(*mkdir)   (struct inode *, struct dentry *, struct iattr *);
+-	int	(*rmdir)   (struct inode *, struct qstr *);
++			    unsigned int, struct iattr *, struct group_info *);
++	int	(*mkdir)   (struct inode *, struct dentry *, struct iattr *,
++			    struct group_info *);
++	int	(*rmdir)   (struct inode *, struct qstr *,
++			    struct group_info *);
+ 	int	(*readdir) (struct dentry *, const struct cred *,
+-			    u64, struct page **, unsigned int, int);
++			    u64, struct page **, unsigned int, int,
++			    struct group_info *);
+ 	int	(*mknod)   (struct inode *, struct dentry *, struct iattr *,
+-			    dev_t);
++			    dev_t, struct group_info *);
+ 	int	(*statfs)  (struct nfs_server *, struct nfs_fh *,
+ 			    struct nfs_fsstat *);
+ 	int	(*fsinfo)  (struct nfs_server *, struct nfs_fh *,
+diff --git a/bundle/include/linux/sunrpc/sched.h b/bundle/include/linux/sunrpc/sched.h
+index bbcefd3f5..22823e19c 100644
+--- a/bundle/include/linux/sunrpc/sched.h
++++ b/bundle/include/linux/sunrpc/sched.h
+@@ -26,6 +26,7 @@ struct rpc_message {
+ 	void *			rpc_argp;	/* Arguments */
+ 	void *			rpc_resp;	/* Result */
+ 	const struct cred *	rpc_cred;	/* Credentials */
++	struct group_info *	rpc_grphint;	/* Hints to relevant groups */
+ };
+ 
+ struct rpc_call_ops;
+diff --git a/bundle/net/sunrpc/auth_unix.c b/bundle/net/sunrpc/auth_unix.c
+index 28fbc8393..22bde103b 100644
+--- a/bundle/net/sunrpc/auth_unix.c
++++ b/bundle/net/sunrpc/auth_unix.c
+@@ -95,6 +95,28 @@ unx_match(struct auth_cred *acred, struct rpc_cred *cred, int flags)
+ 	return 1;
+ }
+ 
++/* a simple bsearch */
++static int sunrpc_groups_search(const struct group_info *group_info, kgid_t grp)
++{
++	unsigned int left, right;
++
++	if (!group_info)
++		return 0;
++
++	left = 0;
++	right = group_info->ngroups;
++	while (left < right) {
++		unsigned int mid = (left+right)/2;
++		if (gid_gt(grp, GROUP_AT(group_info, mid)))
++			left = mid + 1;
++		else if (gid_lt(grp, GROUP_AT(group_info, mid)))
++			right = mid;
++		else
++			return 1;
++	}
++	return 0;
++}
++
+ /*
+  * Marshal credentials.
+  * Maybe we should keep a cached credential for performance reasons.
+@@ -109,6 +131,8 @@ unx_marshal(struct rpc_task *task, struct xdr_stream *xdr)
+ 	struct group_info *gi = cred->cr_cred->group_info;
+ 	struct user_namespace *userns = clnt->cl_cred ?
+ 		clnt->cl_cred->user_ns : &init_user_ns;
++	struct group_info *gh = task->tk_msg.rpc_grphint;
++	int n = 0;
+ 
+ 	/* Credential */
+ 
+@@ -128,9 +152,24 @@ unx_marshal(struct rpc_task *task, struct xdr_stream *xdr)
+ 	*p++ = cpu_to_be32(from_kgid_munged(userns, cred->cr_cred->fsgid));
+ 
+ 	gidarr_len = p++;
+-	if (gi)
+-		for (i = 0; i < UNX_NGROUPS && i < gi->ngroups; i++)
+-			*p++ = cpu_to_be32(from_kgid_munged(userns, GROUP_AT(gi, i)));
++	if (gi) {
++		if (gi->ngroups > UNX_NGROUPS && gh) {
++			/* pick the few relevant groups we're a member of */
++			for (i = 0; i < gh->ngroups; i++) {
++				if (!sunrpc_groups_search(gh, GROUP_AT(gh, i)))
++					continue;
++				*p++ = cpu_to_be32(from_kgid_munged(userns,
++								    GROUP_AT(gh, i)));
++				n++;
++				if (n == UNX_NGROUPS)
++					break;
++			}
++		} else {
++			for (i = 0; i < UNX_NGROUPS && i < gi->ngroups; i++)
++				*p++ = cpu_to_be32(from_kgid_munged(userns,
++								    GROUP_AT(gi, i)));
++		}
++	}
+ 	*gidarr_len = cpu_to_be32(p - gidarr_len - 1);
+ 	*cred_len = cpu_to_be32((p - cred_len - 1) << 2);
+ 	p = xdr_reserve_space(xdr, (p - gidarr_len - 1) << 2);
+diff --git a/bundle/net/sunrpc/clnt.c b/bundle/net/sunrpc/clnt.c
+index 0b929af1b..8c02aab86 100644
+--- a/bundle/net/sunrpc/clnt.c
++++ b/bundle/net/sunrpc/clnt.c
+@@ -1479,6 +1479,8 @@ rpc_task_set_rpc_message(struct rpc_task *task, const struct rpc_message *msg)
+ 		task->tk_msg.rpc_cred = msg->rpc_cred;
+ 		if (!(task->tk_flags & RPC_TASK_CRED_NOREF))
+ 			get_cred(task->tk_msg.rpc_cred);
++		if (msg->rpc_grphint != NULL)
++			task->tk_msg.rpc_grphint = get_group_info(msg->rpc_grphint);
+ 	}
+ }
+ 
+diff --git a/bundle/net/sunrpc/sched.c b/bundle/net/sunrpc/sched.c
+index 786b075bd..9a0abee85 100644
+--- a/bundle/net/sunrpc/sched.c
++++ b/bundle/net/sunrpc/sched.c
+@@ -1174,6 +1174,10 @@ static void rpc_release_resources_task(struct rpc_task *task)
+ 			put_cred(task->tk_msg.rpc_cred);
+ 		task->tk_msg.rpc_cred = NULL;
+ 	}
++	if (task->tk_msg.rpc_grphint) {
++		put_group_info(task->tk_msg.rpc_grphint);
++		task->tk_msg.rpc_grphint = NULL;
++	}
+ 	rpc_task_release_client(task);
+ }
+ 

@@ -1,0 +1,16 @@
+[book]
+authors = ["VAST NFS Authors"]
+language = "en"
+multilingual = false
+src = "src"
+title = "VAST NFS"
+
+[preprocessor.vastnfs]
+command = "preproc.py"
+renderer = ["html"]
+
+[output.html]
+
+[output.topbar]
+command = "output.py"
+renderer = ["html"]

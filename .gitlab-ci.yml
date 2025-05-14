@@ -1,0 +1,21 @@
+stages:
+  - init
+  - child
+
+init:
+  stage: init
+  script:
+    - exec scripts/ci-test.sh
+  tags:
+    - kernel-test
+  artifacts:
+    paths:
+      - generated-config.yml
+
+child-pipeline:
+  stage: child
+  trigger:
+    strategy: depend
+    include:
+      - artifact: generated-config.yml
+        job: init

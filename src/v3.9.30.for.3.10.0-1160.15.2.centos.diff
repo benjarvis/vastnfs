@@ -1,0 +1,1501 @@
+diff --git a/bundle/fs/lockd/host.c b/bundle/fs/lockd/host.c
+index 530ee0151..7936b3a2f 100644
+--- a/bundle/fs/lockd/host.c
++++ b/bundle/fs/lockd/host.c
+@@ -288,12 +288,11 @@ void nlmclnt_release_host(struct nlm_host *host)
+ 
+ 	WARN_ON_ONCE(host->h_server);
+ 
+-	if (atomic_dec_and_test(&host->h_count)) {
++	if (atomic_dec_and_mutex_lock(&host->h_count, &nlm_host_mutex)) {
+ 		WARN_ON_ONCE(!list_empty(&host->h_lockowners));
+ 		WARN_ON_ONCE(!list_empty(&host->h_granted));
+ 		WARN_ON_ONCE(!list_empty(&host->h_reclaim));
+ 
+-		mutex_lock(&nlm_host_mutex);
+ 		nlm_destroy_host_locked(host);
+ 		mutex_unlock(&nlm_host_mutex);
+ 	}
+@@ -617,9 +616,8 @@ nlm_shutdown_hosts_net(struct net *net)
+ 
+ 	/* Then, perform a garbage collection pass */
+ 	nlm_gc_hosts(net);
+-	mutex_unlock(&nlm_host_mutex);
+-
+ 	nlm_complain_hosts(net);
++	mutex_unlock(&nlm_host_mutex);
+ }
+ 
+ /*
+diff --git a/bundle/fs/nfs/dir.c b/bundle/fs/nfs/dir.c
+index 4f4a171da..712b796f9 100644
+--- a/bundle/fs/nfs/dir.c
++++ b/bundle/fs/nfs/dir.c
+@@ -129,7 +129,7 @@ out:
+ static int
+ nfs_closedir(struct inode *inode, struct file *filp)
+ {
+-	put_nfs_open_dir_context(filp->f_path.dentry->d_inode, filp->private_data);
++	put_nfs_open_dir_context(file_inode(filp), filp->private_data);
+ 	return 0;
+ }
+ 
+@@ -572,6 +572,9 @@ int nfs_readdir_page_filler(nfs_readdir_descriptor_t *desc, struct nfs_entry *en
+ 	xdr_set_scratch_buffer(&stream, page_address(scratch), PAGE_SIZE);
+ 
+ 	do {
++		if (entry->label)
++			entry->label->len = NFS4_MAXLABELLEN;
++
+ 		status = xdr_decode(desc, entry, &stream);
+ 		if (status != 0) {
+ 			if (status == -EAGAIN)
+diff --git a/bundle/fs/nfs/direct.c b/bundle/fs/nfs/direct.c
+index f639618b7..f221dc911 100644
+--- a/bundle/fs/nfs/direct.c
++++ b/bundle/fs/nfs/direct.c
+@@ -489,7 +489,7 @@ static ssize_t nfs_direct_read_schedule_segment(struct nfs_pageio_descriptor *de
+ 		result = -ENOMEM;
+ 		npages = nfs_page_array_len(pgbase, bytes);
+ 		if (!pagevec)
+-			pagevec = kmalloc(npages * sizeof(struct page *),
++			pagevec = kmalloc((npages + 1) * sizeof(struct page *),
+ 					  GFP_KERNEL);
+ 		if (!pagevec)
+ 			break;
+@@ -873,7 +873,7 @@ static ssize_t nfs_direct_write_schedule_segment(struct nfs_pageio_descriptor *d
+ 		result = -ENOMEM;
+ 		npages = nfs_page_array_len(pgbase, bytes);
+ 		if (!pagevec)
+-			pagevec = kmalloc(npages * sizeof(struct page *), GFP_KERNEL);
++			pagevec = kmalloc((npages + 1) * sizeof(struct page *), GFP_KERNEL);
+ 		if (!pagevec)
+ 			break;
+ 
+diff --git a/bundle/fs/nfs/file.c b/bundle/fs/nfs/file.c
+index 3952d50a5..4084b9969 100644
+--- a/bundle/fs/nfs/file.c
++++ b/bundle/fs/nfs/file.c
+@@ -179,7 +179,6 @@ nfs_file_read(struct kiocb *iocb, const struct iovec *iov,
+ 		if (result > 0)
+ 			nfs_add_stats(inode, NFSIOS_NORMALREADBYTES, result);
+ 	}
+-	nfs_end_io_read(inode);
+ 	return result;
+ }
+ EXPORT_SYMBOL_GPL(nfs_file_read);
+@@ -202,7 +201,6 @@ nfs_file_splice_read(struct file *filp, loff_t *ppos,
+ 		if (res > 0)
+ 			nfs_add_stats(inode, NFSIOS_NORMALREADBYTES, res);
+ 	}
+-	nfs_end_io_read(inode);
+ 	return res;
+ }
+ EXPORT_SYMBOL_GPL(nfs_file_splice_read);
+@@ -839,15 +837,18 @@ do_setlk(struct file *filp, int cmd, struct file_lock *fl, int is_local)
+ 		goto out;
+ 
+ 	/*
+-	 * Revalidate the cache if the server has time stamps granular
+-	 * enough to detect subsecond changes.  Otherwise, clear the
+-	 * cache to prevent missing any changes.
++	 * Invalidate cache to prevent missing any changes.  If
++	 * the file is mapped, clear the page cache as well so
++	 * those mappings will be loaded.
+ 	 *
+ 	 * This makes locking act as a cache coherency point.
+ 	 */
+ 	nfs_sync_mapping(filp->f_mapping);
+-	if (!NFS_PROTO(inode)->have_delegation(inode, FMODE_READ))
++	if (!NFS_PROTO(inode)->have_delegation(inode, FMODE_READ)) {
+ 		nfs_zap_caches(inode);
++		if (mapping_mapped(filp->f_mapping))
++			nfs_revalidate_mapping(inode, filp->f_mapping);
++	}
+ out:
+ 	return status;
+ }
+diff --git a/bundle/fs/nfs/filelayout/filelayout.c b/bundle/fs/nfs/filelayout/filelayout.c
+index 4aad16f19..344762c29 100644
+--- a/bundle/fs/nfs/filelayout/filelayout.c
++++ b/bundle/fs/nfs/filelayout/filelayout.c
+@@ -749,11 +749,15 @@ filelayout_free_lseg(struct pnfs_layout_segment *lseg)
+ 	/* This assumes a single RW lseg */
+ 	if (lseg->pls_range.iomode == IOMODE_RW) {
+ 		struct nfs4_filelayout *flo;
++		struct inode *inode;
+ 
+ 		flo = FILELAYOUT_FROM_HDR(lseg->pls_layout);
++		inode = flo->generic_hdr.plh_inode;
++		spin_lock(&inode->i_lock);
+ 		flo->commit_info.nbuckets = 0;
+ 		kfree(flo->commit_info.buckets);
+ 		flo->commit_info.buckets = NULL;
++		spin_unlock(&inode->i_lock);
+ 	}
+ 	_filelayout_free_lseg(fl);
+ }
+diff --git a/bundle/fs/nfs/inode.c b/bundle/fs/nfs/inode.c
+index 57afb6c41..3fc102ee8 100644
+--- a/bundle/fs/nfs/inode.c
++++ b/bundle/fs/nfs/inode.c
+@@ -988,6 +988,13 @@ __nfs_revalidate_inode(struct nfs_server *server, struct inode *inode)
+ 	if (NFS_STALE(inode))
+ 		goto out;
+ 
++	/* pNFS: Attributes aren't updated until we layoutcommit */
++	if (S_ISREG(inode->i_mode)) {
++		status = pnfs_sync_inode(inode, false);
++		if (status)
++			goto out;
++	}
++
+ 	status = -ENOMEM;
+ 	fattr = nfs_alloc_fattr();
+ 	if (fattr == NULL)
+@@ -1485,28 +1492,12 @@ static int nfs_inode_attrs_need_update(const struct inode *inode, const struct n
+ 		((long)nfsi->attr_gencount - (long)nfs_read_attr_generation_counter() > 0);
+ }
+ 
+-/*
+- * Don't trust the change_attribute, mtime, ctime or size if
+- * a pnfs LAYOUTCOMMIT is outstanding
+- */
+-static void nfs_inode_attrs_handle_layoutcommit(struct inode *inode,
+-		struct nfs_fattr *fattr)
+-{
+-	if (pnfs_layoutcommit_outstanding(inode))
+-		fattr->valid &= ~(NFS_ATTR_FATTR_CHANGE |
+-				NFS_ATTR_FATTR_MTIME |
+-				NFS_ATTR_FATTR_CTIME |
+-				NFS_ATTR_FATTR_SIZE);
+-}
+-
+ static int nfs_refresh_inode_locked(struct inode *inode, struct nfs_fattr *fattr)
+ {
+ 	int ret;
+ 
+ 	trace_nfs_refresh_inode_enter(inode);
+ 
+-	nfs_inode_attrs_handle_layoutcommit(inode, fattr);
+-
+ 	if (nfs_inode_attrs_need_update(inode, fattr))
+ 		ret = nfs_update_inode(inode, fattr);
+ 	else
+@@ -1945,7 +1936,6 @@ struct inode *nfs_alloc_inode(struct super_block *sb)
+ #if IS_ENABLED(CONFIG_NFS_V4)
+ 	nfsi->nfs4_acl = NULL;
+ #endif /* CONFIG_NFS_V4 */
+-	mutex_init(&nfsi->parallel_io_mutex);
+ 	return &nfsi->vfs_inode;
+ }
+ EXPORT_SYMBOL_GPL(nfs_alloc_inode);
+@@ -1987,7 +1977,6 @@ static void init_once(void *foo)
+ 	atomic_set(&nfsi->silly_count, 1);
+ 	INIT_HLIST_HEAD(&nfsi->silly_list);
+ 	init_waitqueue_head(&nfsi->waitqueue);
+-	atomic_set(&nfsi->parallel_io_count, 0);
+ 	nfs4_init_once(nfsi);
+ }
+ 
+diff --git a/bundle/fs/nfs/internal.h b/bundle/fs/nfs/internal.h
+index 9f8682f97..312af2941 100644
+--- a/bundle/fs/nfs/internal.h
++++ b/bundle/fs/nfs/internal.h
+@@ -475,7 +475,6 @@ extern void nfs_sb_deactive(struct super_block *sb);
+ 
+ /* io.c */
+ extern void nfs_start_io_read(struct inode *inode);
+-extern void nfs_end_io_read(struct inode *inode);
+ extern void nfs_start_io_write(struct inode *inode);
+ extern void nfs_end_io_write(struct inode *inode);
+ extern void nfs_start_io_direct(struct inode *inode);
+diff --git a/bundle/fs/nfs/io.c b/bundle/fs/nfs/io.c
+index 830e25112..b5a2d42aa 100644
+--- a/bundle/fs/nfs/io.c
++++ b/bundle/fs/nfs/io.c
+@@ -29,12 +29,7 @@ static void nfs_block_o_direct(struct nfs_inode *nfsi, struct inode *inode)
+  * Declare that a buffered read operation is about to start, and ensure
+  * that we block all direct I/O.
+  * On exit, the function ensures that the NFS_INO_ODIRECT flag is unset,
+- * and holds a lock on inode->i_mutex to ensure that the flag
+- * cannot be changed.
+- * In practice, this means that buffered read operations are allowed to
+- * execute in parallel, thanks to not needing to grab the lock if another
+- * read is already holding it, whereas direct I/O operations need to wait
+- * until buffered read operations complete to set NFS_INO_ODIRECT.
++ * and holds a lock on inode->i_mutex.
+  * Note that buffered writes and truncates both take i_mutex, meaning that
+  * those are serialised w.r.t. the reads.
+  */
+@@ -43,32 +38,11 @@ nfs_start_io_read(struct inode *inode)
+ {
+ 	struct nfs_inode *nfsi = NFS_I(inode);
+ 
+-	mutex_lock(&nfsi->parallel_io_mutex);
+-
+ 	if (test_bit(NFS_INO_ODIRECT, &nfsi->flags) != 0) {
+ 		mutex_lock(&inode->i_mutex);
+ 		nfs_block_o_direct(nfsi, inode);
+-		atomic_inc(&nfsi->parallel_io_count);
+-	} else if (atomic_inc_return(&nfsi->parallel_io_count) == 1)
+-		mutex_lock(&inode->i_mutex);
+-
+-	mutex_unlock(&nfsi->parallel_io_mutex);
+-}
+-
+-/**
+- * nfs_end_io_read - declare that the buffered read operation is done
+- * @inode - file inode
+- *
+- * Declare that a buffered read operation is done, and release i_mutex if
+- * there are no more read operations.
+- */
+-void
+-nfs_end_io_read(struct inode *inode)
+-{
+-	struct nfs_inode *nfsi = NFS_I(inode);
+-
+-	if (atomic_dec_and_test(&nfsi->parallel_io_count))
+ 		mutex_unlock(&inode->i_mutex);
++	}
+ }
+ 
+ /**
+@@ -116,12 +90,7 @@ static void nfs_block_buffered(struct nfs_inode *nfsi, struct inode *inode)
+  * On exit, the function ensures that the NFS_INO_ODIRECT flag is set,
+  * and holds a lock on i_mutex to ensure that the flag cannot be
+  * changed.
+- * In practice, this means that direct I/O operations are allowed to
+- * execute in parallel, since we have already taken the lock on the
+- * first operation, whereas buffered I/O operations need to wait for
+- * outstanding direct I/O operations to complete in order to clear
+- * NFS_INO_ODIRECT.
+- * Note that buffered writes and truncates both take a write i_mutex,
++ * Note that buffered writes and truncates both take i_mutex,
+  * meaning that those are serialised w.r.t. O_DIRECT.
+  */
+ void
+@@ -129,30 +98,19 @@ nfs_start_io_direct(struct inode *inode)
+ {
+ 	struct nfs_inode *nfsi = NFS_I(inode);
+ 
+-	mutex_lock(&nfsi->parallel_io_mutex);
+-
+-	if (test_bit(NFS_INO_ODIRECT, &nfsi->flags) == 0) {
+-		mutex_lock(&inode->i_mutex);
++	mutex_lock(&inode->i_mutex);
++	if (test_bit(NFS_INO_ODIRECT, &nfsi->flags) == 0)
+ 		nfs_block_buffered(nfsi, inode);
+-		atomic_inc(&nfsi->parallel_io_count);
+-	} else if (atomic_inc_return(&nfsi->parallel_io_count) == 1)
+-		mutex_lock(&inode->i_mutex);
+-
+-	mutex_unlock(&nfsi->parallel_io_mutex);
+ }
+ 
+ /**
+  * nfs_end_io_direct - declare that the direct i/o operation is done
+  * @inode - file inode
+  *
+- * Declare that a direct I/O operation is done, and release the shared
+- * lock on inode->i_rwsem.
++ * Declare that a direct I/O operation is done, and release i_mutex
+  */
+ void
+ nfs_end_io_direct(struct inode *inode)
+ {
+-	struct nfs_inode *nfsi = NFS_I(inode);
+-
+-	if (atomic_dec_and_test(&nfsi->parallel_io_count))
+-		mutex_unlock(&inode->i_mutex);
++	mutex_unlock(&inode->i_mutex);
+ }
+diff --git a/bundle/fs/nfs/nfs3proc.c b/bundle/fs/nfs/nfs3proc.c
+index 933d671e0..17a82e770 100644
+--- a/bundle/fs/nfs/nfs3proc.c
++++ b/bundle/fs/nfs/nfs3proc.c
+@@ -135,11 +135,6 @@ nfs3_proc_setattr(struct dentry *dentry, struct nfs_fattr *fattr,
+ 	};
+ 	int	status;
+ 
+-	msg.rpc_groups.ngroups = 1;
+-	msg.rpc_groups.groups[0] = dentry->d_inode->i_gid;
+-	if (sattr->ia_valid & ATTR_GID)
+-		msg.rpc_groups.groups[msg.rpc_groups.ngroups++] = sattr->ia_gid;
+-
+ 	dprintk("NFS call  setattr\n");
+ 	if (sattr->ia_valid & ATTR_FILE)
+ 		msg.rpc_cred = nfs_file_cred(sattr->ia_file);
+@@ -172,9 +167,6 @@ nfs3_proc_lookup(struct inode *dir, struct qstr *name,
+ 	};
+ 	int			status;
+ 
+-	msg.rpc_groups.ngroups = 1;
+-	msg.rpc_groups.groups[0] = dir->i_gid;
+-
+ 	dprintk("NFS call  lookup %s\n", name->name);
+ 	res.dir_attr = nfs_alloc_fattr();
+ 	if (res.dir_attr == NULL)
+@@ -341,8 +333,6 @@ nfs3_proc_create(struct inode *dir, struct dentry *dentry, struct iattr *sattr,
+ 		goto out;
+ 
+ 	data->msg.rpc_proc = &nfs3_procedures[NFS3PROC_CREATE];
+-	data->msg.rpc_groups.ngroups = 1;
+-	data->msg.rpc_groups.groups[0] = dir->i_gid;
+ 	data->arg.create.fh = NFS_FH(dir);
+ 	data->arg.create.name = dentry->d_name.name;
+ 	data->arg.create.len = dentry->d_name.len;
+@@ -424,9 +414,6 @@ nfs3_proc_remove(struct inode *dir, struct qstr *name)
+ 	};
+ 	int status = -ENOMEM;
+ 
+-	msg.rpc_groups.ngroups = 1;
+-	msg.rpc_groups.groups[0] = dir->i_gid;
+-
+ 	dprintk("NFS call  remove %s\n", name->name);
+ 	res.dir_attr = nfs_alloc_fattr();
+ 	if (res.dir_attr == NULL)
+@@ -505,9 +492,6 @@ nfs3_proc_link(struct inode *inode, struct inode *dir, struct qstr *name)
+ 	};
+ 	int status = -ENOMEM;
+ 
+-	msg.rpc_groups.ngroups = 1;
+-	msg.rpc_groups.groups[0] = dir->i_gid;
+-
+ 	dprintk("NFS call  link %s\n", name->name);
+ 	res.fattr = nfs_alloc_fattr();
+ 	res.dir_attr = nfs_alloc_fattr();
+@@ -540,8 +524,6 @@ nfs3_proc_symlink(struct inode *dir, struct dentry *dentry, struct page *page,
+ 	if (data == NULL)
+ 		goto out;
+ 	data->msg.rpc_proc = &nfs3_procedures[NFS3PROC_SYMLINK];
+-	data->msg.rpc_groups.ngroups = 1;
+-	data->msg.rpc_groups.groups[0] = dir->i_gid;
+ 	data->arg.symlink.fromfh = NFS_FH(dir);
+ 	data->arg.symlink.fromname = dentry->d_name.name;
+ 	data->arg.symlink.fromlen = dentry->d_name.len;
+@@ -573,8 +555,6 @@ nfs3_proc_mkdir(struct inode *dir, struct dentry *dentry, struct iattr *sattr)
+ 		goto out;
+ 
+ 	data->msg.rpc_proc = &nfs3_procedures[NFS3PROC_MKDIR];
+-	data->msg.rpc_groups.ngroups = 1;
+-	data->msg.rpc_groups.groups[0] = dir->i_gid;
+ 	data->arg.mkdir.fh = NFS_FH(dir);
+ 	data->arg.mkdir.name = dentry->d_name.name;
+ 	data->arg.mkdir.len = dentry->d_name.len;
+@@ -605,8 +585,6 @@ nfs3_proc_rmdir(struct inode *dir, struct qstr *name)
+ 		.rpc_argp	= &arg,
+ 	};
+ 	int status = -ENOMEM;
+-	msg.rpc_groups.ngroups = 1;
+-	msg.rpc_groups.groups[0] = dir->i_gid;
+ 
+ 	dprintk("NFS call  rmdir %s\n", name->name);
+ 	dir_attr = nfs_alloc_fattr();
+@@ -697,8 +675,6 @@ nfs3_proc_mknod(struct inode *dir, struct dentry *dentry, struct iattr *sattr,
+ 		goto out;
+ 
+ 	data->msg.rpc_proc = &nfs3_procedures[NFS3PROC_MKNOD];
+-	data->msg.rpc_groups.ngroups = 1;
+-	data->msg.rpc_groups.groups[0] = dir->i_gid;
+ 	data->arg.mknod.fh = NFS_FH(dir);
+ 	data->arg.mknod.name = dentry->d_name.name;
+ 	data->arg.mknod.len = dentry->d_name.len;
+diff --git a/bundle/fs/nfs/nfs42proc.c b/bundle/fs/nfs/nfs42proc.c
+index 1fdf66723..f39cd4f92 100644
+--- a/bundle/fs/nfs/nfs42proc.c
++++ b/bundle/fs/nfs/nfs42proc.c
+@@ -215,9 +215,6 @@ ssize_t nfs42_proc_copy(struct file *src, loff_t pos_src,
+ 	};
+ 	ssize_t err, err2;
+ 
+-	if (!nfs_server_capable(file_inode(dst), NFS_CAP_COPY))
+-		return -EOPNOTSUPP;
+-
+ 	src_lock = nfs_get_lock_context(nfs_file_open_context(src));
+ 	if (IS_ERR(src_lock))
+ 		return PTR_ERR(src_lock);
+diff --git a/bundle/fs/nfs/nfs4file.c b/bundle/fs/nfs/nfs4file.c
+index 02244af82..78f2c6b9f 100644
+--- a/bundle/fs/nfs/nfs4file.c
++++ b/bundle/fs/nfs/nfs4file.c
+@@ -133,9 +133,10 @@ static ssize_t nfs4_copy_file_range(struct file *file_in, loff_t pos_in,
+ 				    struct file *file_out, loff_t pos_out,
+ 				    size_t count, unsigned int flags)
+ {
++	if (!nfs_server_capable(file_inode(file_out), NFS_CAP_COPY))
++		return -EOPNOTSUPP;
+ 	if (file_inode(file_in) == file_inode(file_out))
+-		return -EINVAL;
+-
++		return -EOPNOTSUPP;
+ 	return nfs42_proc_copy(file_in, pos_in, file_out, pos_out, count);
+ }
+ 
+diff --git a/bundle/fs/nfs/nfs4namespace.c b/bundle/fs/nfs/nfs4namespace.c
+index 354c34b05..0c386123b 100644
+--- a/bundle/fs/nfs/nfs4namespace.c
++++ b/bundle/fs/nfs/nfs4namespace.c
+@@ -182,7 +182,7 @@ static struct rpc_clnt *nfs_find_best_sec(struct rpc_clnt *clnt,
+ 				* flavor. This is mostly for RPC_AUTH_GSS
+ 				* where cr_init obtains a gss context
+ 				*/
+-				cred = rpcauth_lookupcred(new->cl_auth, NULL, 0);
++				cred = rpcauth_lookupcred(new->cl_auth, 0);
+ 				if (IS_ERR(cred)) {
+ 					rpc_shutdown_client(new);
+ 					continue;
+diff --git a/bundle/fs/nfs/nfs4proc.c b/bundle/fs/nfs/nfs4proc.c
+index f091c83bc..6838f97ca 100644
+--- a/bundle/fs/nfs/nfs4proc.c
++++ b/bundle/fs/nfs/nfs4proc.c
+@@ -5341,8 +5341,6 @@ static int _nfs4_get_security_label(struct inode *inode, void *buf,
+ 		return ret;
+ 	if (!(fattr.valid & NFS_ATTR_FATTR_V4_SECURITY_LABEL))
+ 		return -ENOENT;
+-	if (buflen < label.len)
+-		return -ERANGE;
+ 	return 0;
+ }
+ 
+diff --git a/bundle/fs/nfs/nfs4xdr.c b/bundle/fs/nfs/nfs4xdr.c
+index 941670f95..d26ad6c6b 100644
+--- a/bundle/fs/nfs/nfs4xdr.c
++++ b/bundle/fs/nfs/nfs4xdr.c
+@@ -3482,7 +3482,7 @@ static int decode_attr_exclcreat_supported(struct xdr_stream *xdr,
+ static int decode_attr_filehandle(struct xdr_stream *xdr, uint32_t *bitmap, struct nfs_fh *fh)
+ {
+ 	__be32 *p;
+-	int len;
++	u32 len;
+ 
+ 	if (fh != NULL)
+ 		memset(fh, 0, sizeof(*fh));
+@@ -4243,7 +4243,11 @@ static int decode_attr_security_label(struct xdr_stream *xdr, uint32_t *bitmap,
+ 			goto out_overflow;
+ 		if (len < NFS4_MAXLABELLEN) {
+ 			if (label) {
+-				memcpy(label->label, p, len);
++				if (label->len) {
++					if (label->len < len)
++						return -ERANGE;
++					memcpy(label->label, p, len);
++				}
+ 				label->len = len;
+ 				label->pi = pi;
+ 				label->lfs = lfs;
+diff --git a/bundle/fs/nfs/unlink.c b/bundle/fs/nfs/unlink.c
+index f86227163..b4790d8ee 100644
+--- a/bundle/fs/nfs/unlink.c
++++ b/bundle/fs/nfs/unlink.c
+@@ -442,12 +442,6 @@ nfs_async_rename(struct inode *old_dir, struct inode *new_dir,
+ 	msg.rpc_resp = &data->res;
+ 	msg.rpc_cred = data->cred;
+ 
+-	if (NFS_PROTO(old_dir)->version <= 3) {
+-		msg.rpc_groups.ngroups = 2;
+-		msg.rpc_groups.groups[0] = old_dir->i_gid;
+-		msg.rpc_groups.groups[1] = new_dir->i_gid;
+-	}
+-
+ 	/* set up nfs_renamedata */
+ 	data->old_dir = old_dir;
+ 	ihold(old_dir);
+diff --git a/bundle/fs/nfsd/nfs4callback.c b/bundle/fs/nfsd/nfs4callback.c
+index 826a589f5..2021d7a14 100644
+--- a/bundle/fs/nfsd/nfs4callback.c
++++ b/bundle/fs/nfsd/nfs4callback.c
+@@ -746,6 +746,31 @@ static int max_cb_time(struct net *net)
+ 	return max(nn->nfsd4_lease/10, (time_t)1) * HZ;
+ }
+ 
++static struct workqueue_struct *callback_wq;
++
++static bool nfsd4_queue_cb(struct nfsd4_callback *cb)
++{
++	return queue_work(callback_wq, &cb->cb_work);
++}
++
++static void nfsd41_cb_inflight_begin(struct nfs4_client *clp)
++{
++	atomic_inc(&clp->cl_cb_inflight);
++}
++
++static void nfsd41_cb_inflight_end(struct nfs4_client *clp)
++{
++
++	if (atomic_dec_and_test(&clp->cl_cb_inflight))
++		wake_up_var(&clp->cl_cb_inflight);
++}
++
++static void nfsd41_cb_inflight_wait_complete(struct nfs4_client *clp)
++{
++	wait_var_event(&clp->cl_cb_inflight,
++			!atomic_read(&clp->cl_cb_inflight));
++}
++
+ static const struct cred *get_backchannel_cred(struct nfs4_client *clp, struct rpc_clnt *client, struct nfsd4_session *ses)
+ {
+ 	if (clp->cl_minorversion == 0) {
+@@ -857,14 +882,21 @@ static void nfsd4_cb_probe_done(struct rpc_task *task, void *calldata)
+ 		clp->cl_cb_state = NFSD4_CB_UP;
+ }
+ 
++static void nfsd4_cb_probe_release(void *calldata)
++{
++	struct nfs4_client *clp = container_of(calldata, struct nfs4_client, cl_cb_null);
++
++	nfsd41_cb_inflight_end(clp);
++
++}
++
+ static const struct rpc_call_ops nfsd4_cb_probe_ops = {
+ 	/* XXX: release method to ensure we set the cb channel down if
+ 	 * necessary on early failure? */
+ 	.rpc_call_done = nfsd4_cb_probe_done,
++	.rpc_release = nfsd4_cb_probe_release,
+ };
+ 
+-static struct workqueue_struct *callback_wq;
+-
+ /*
+  * Poke the callback thread to process any updates to the callback
+  * parameters, and send a null probe.
+@@ -895,9 +927,12 @@ void nfsd4_change_callback(struct nfs4_client *clp, struct nfs4_cb_conn *conn)
+  * If the slot is available, then mark it busy.  Otherwise, set the
+  * thread for sleeping on the callback RPC wait queue.
+  */
+-static bool nfsd41_cb_get_slot(struct nfs4_client *clp, struct rpc_task *task)
++static bool nfsd41_cb_get_slot(struct nfsd4_callback *cb, struct rpc_task *task)
+ {
+-	if (test_and_set_bit(0, &clp->cl_cb_slot_busy) != 0) {
++	struct nfs4_client *clp = cb->cb_clp;
++
++	if (!cb->cb_holds_slot &&
++	    test_and_set_bit(0, &clp->cl_cb_slot_busy) != 0) {
+ 		rpc_sleep_on(&clp->cl_cb_waitq, task, NULL);
+ 		/* Race breaker */
+ 		if (test_and_set_bit(0, &clp->cl_cb_slot_busy) != 0) {
+@@ -906,9 +941,31 @@ static bool nfsd41_cb_get_slot(struct nfs4_client *clp, struct rpc_task *task)
+ 		}
+ 		rpc_wake_up_queued_task(&clp->cl_cb_waitq, task);
+ 	}
++	cb->cb_holds_slot = true;
+ 	return true;
+ }
+ 
++static void nfsd41_cb_release_slot(struct nfsd4_callback *cb)
++{
++	struct nfs4_client *clp = cb->cb_clp;
++
++	if (cb->cb_holds_slot) {
++		cb->cb_holds_slot = false;
++		clear_bit(0, &clp->cl_cb_slot_busy);
++		rpc_wake_up_next(&clp->cl_cb_waitq);
++	}
++}
++
++static void nfsd41_destroy_cb(struct nfsd4_callback *cb)
++{
++	struct nfs4_client *clp = cb->cb_clp;
++
++	nfsd41_cb_release_slot(cb);
++	if (cb->cb_ops && cb->cb_ops->release)
++		cb->cb_ops->release(cb);
++	nfsd41_cb_inflight_end(clp);
++}
++
+ /*
+  * TODO: cb_sequence should support referring call lists, cachethis, multiple
+  * slots, and mark callback channel down on communication errors.
+@@ -926,10 +983,8 @@ static void nfsd4_cb_prepare(struct rpc_task *task, void *calldata)
+ 	 */
+ 	cb->cb_seq_status = 1;
+ 	cb->cb_status = 0;
+-	if (minorversion) {
+-		if (!nfsd41_cb_get_slot(clp, task))
+-			return;
+-	}
++	if (minorversion && !nfsd41_cb_get_slot(cb, task))
++		return;
+ 	rpc_call_start(task);
+ }
+ 
+@@ -955,6 +1010,9 @@ static bool nfsd4_cb_sequence_done(struct rpc_task *task, struct nfsd4_callback
+ 		return true;
+ 	}
+ 
++	if (!cb->cb_holds_slot)
++		goto need_restart;
++
+ 	switch (cb->cb_seq_status) {
+ 	case 0:
+ 		/*
+@@ -992,8 +1050,7 @@ static bool nfsd4_cb_sequence_done(struct rpc_task *task, struct nfsd4_callback
+ 			cb->cb_seq_status);
+ 	}
+ 
+-	clear_bit(0, &clp->cl_cb_slot_busy);
+-	rpc_wake_up_next(&clp->cl_cb_waitq);
++	nfsd41_cb_release_slot(cb);
+ 	dprintk("%s: freed slot, new seqid=%d\n", __func__,
+ 		clp->cl_cb_session->se_cb_seq_nr);
+ 
+@@ -1006,8 +1063,10 @@ retry_nowait:
+ 		ret = false;
+ 	goto out;
+ need_restart:
+-	task->tk_status = 0;
+-	cb->cb_need_restart = true;
++	if (!test_bit(NFSD4_CLIENT_CB_KILL, &clp->cl_flags)) {
++		task->tk_status = 0;
++		cb->cb_need_restart = true;
++	}
+ 	return false;
+ }
+ 
+@@ -1048,9 +1107,9 @@ static void nfsd4_cb_release(void *calldata)
+ 	struct nfsd4_callback *cb = calldata;
+ 
+ 	if (cb->cb_need_restart)
+-		nfsd4_run_cb(cb);
++		nfsd4_queue_cb(cb);
+ 	else
+-		cb->cb_ops->release(cb);
++		nfsd41_destroy_cb(cb);
+ 
+ }
+ 
+@@ -1084,6 +1143,7 @@ void nfsd4_shutdown_callback(struct nfs4_client *clp)
+ 	 */
+ 	nfsd4_run_cb(&clp->cl_cb_null);
+ 	flush_workqueue(callback_wq);
++	nfsd41_cb_inflight_wait_complete(clp);
+ }
+ 
+ /* requires cl_lock: */
+@@ -1169,8 +1229,7 @@ nfsd4_run_cb_work(struct work_struct *work)
+ 	clnt = clp->cl_cb_client;
+ 	if (!clnt) {
+ 		/* Callback channel broken, or client killed; give up: */
+-		if (cb->cb_ops && cb->cb_ops->release)
+-			cb->cb_ops->release(cb);
++		nfsd41_destroy_cb(cb);
+ 		return;
+ 	}
+ 
+@@ -1179,6 +1238,7 @@ nfsd4_run_cb_work(struct work_struct *work)
+ 	 */
+ 	if (!cb->cb_ops && clp->cl_minorversion) {
+ 		clp->cl_cb_state = NFSD4_CB_UP;
++		nfsd41_destroy_cb(cb);
+ 		return;
+ 	}
+ 
+@@ -1199,9 +1259,14 @@ void nfsd4_init_cb(struct nfsd4_callback *cb, struct nfs4_client *clp,
+ 	cb->cb_seq_status = 1;
+ 	cb->cb_status = 0;
+ 	cb->cb_need_restart = false;
++	cb->cb_holds_slot = false;
+ }
+ 
+ void nfsd4_run_cb(struct nfsd4_callback *cb)
+ {
+-	queue_work(callback_wq, &cb->cb_work);
++	struct nfs4_client *clp = cb->cb_clp;
++
++	nfsd41_cb_inflight_begin(clp);
++	if (!nfsd4_queue_cb(cb))
++		nfsd41_cb_inflight_end(clp);
+ }
+diff --git a/bundle/fs/nfsd/nfs4proc.c b/bundle/fs/nfsd/nfs4proc.c
+index 283aac309..1b3088634 100644
+--- a/bundle/fs/nfsd/nfs4proc.c
++++ b/bundle/fs/nfsd/nfs4proc.c
+@@ -32,6 +32,7 @@
+  *  NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+  *  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  */
++#include <linux/fs_struct.h>
+ #include <linux/file.h>
+ #include <linux/falloc.h>
+ #include <linux/slab.h>
+@@ -251,11 +252,13 @@ do_open_lookup(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate, stru
+ 		 * Note: create modes (UNCHECKED,GUARDED...) are the same
+ 		 * in NFSv4 as in v3 except EXCLUSIVE4_1.
+ 		 */
++		current->fs->umask = open->op_umask;
+ 		status = do_nfsd_create(rqstp, current_fh, open->op_fname.data,
+ 					open->op_fname.len, &open->op_iattr,
+ 					*resfh, open->op_createmode,
+ 					(u32 *)open->op_verf.data,
+ 					&open->op_truncate, &open->op_created);
++		current->fs->umask = 0;
+ 
+ 		if (!status && open->op_label.len)
+ 			nfsd4_security_inode_setsecctx(*resfh, &open->op_label, open->op_bmval);
+@@ -601,6 +604,7 @@ nfsd4_create(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+ 	if (status)
+ 		return status;
+ 
++	current->fs->umask = create->cr_umask;
+ 	switch (create->cr_type) {
+ 	case NF4LNK:
+ 		status = nfsd_symlink(rqstp, &cstate->current_fh,
+@@ -609,20 +613,22 @@ nfsd4_create(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+ 		break;
+ 
+ 	case NF4BLK:
++		status = nfserr_inval;
+ 		rdev = MKDEV(create->cr_specdata1, create->cr_specdata2);
+ 		if (MAJOR(rdev) != create->cr_specdata1 ||
+ 		    MINOR(rdev) != create->cr_specdata2)
+-			return nfserr_inval;
++			goto out_umask;
+ 		status = nfsd_create(rqstp, &cstate->current_fh,
+ 				     create->cr_name, create->cr_namelen,
+ 				     &create->cr_iattr, S_IFBLK, rdev, &resfh);
+ 		break;
+ 
+ 	case NF4CHR:
++		status = nfserr_inval;
+ 		rdev = MKDEV(create->cr_specdata1, create->cr_specdata2);
+ 		if (MAJOR(rdev) != create->cr_specdata1 ||
+ 		    MINOR(rdev) != create->cr_specdata2)
+-			return nfserr_inval;
++			goto out_umask;
+ 		status = nfsd_create(rqstp, &cstate->current_fh,
+ 				     create->cr_name, create->cr_namelen,
+ 				     &create->cr_iattr,S_IFCHR, rdev, &resfh);
+@@ -666,6 +672,8 @@ nfsd4_create(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+ 	fh_dup2(&cstate->current_fh, &resfh);
+ out:
+ 	fh_put(&resfh);
++out_umask:
++	current->fs->umask = 0;
+ 	return status;
+ }
+ 
+diff --git a/bundle/fs/nfsd/nfs4xdr.c b/bundle/fs/nfsd/nfs4xdr.c
+index defa3f326..f90027fa8 100644
+--- a/bundle/fs/nfsd/nfs4xdr.c
++++ b/bundle/fs/nfsd/nfs4xdr.c
+@@ -33,7 +33,6 @@
+  *  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
+-#include <linux/fs_struct.h>
+ #include <linux/file.h>
+ #include <linux/slab.h>
+ #include <linux/namei.h>
+@@ -683,7 +682,7 @@ nfsd4_decode_create(struct nfsd4_compoundargs *argp, struct nfsd4_create *create
+ 
+ 	status = nfsd4_decode_fattr(argp, create->cr_bmval, &create->cr_iattr,
+ 				    &create->cr_acl, &create->cr_label,
+-				    &current->fs->umask);
++				    &create->cr_umask);
+ 	if (status)
+ 		goto out;
+ 
+@@ -928,7 +927,6 @@ nfsd4_decode_open(struct nfsd4_compoundargs *argp, struct nfsd4_open *open)
+ 	case NFS4_OPEN_NOCREATE:
+ 		break;
+ 	case NFS4_OPEN_CREATE:
+-		current->fs->umask = 0;
+ 		READ_BUF(4);
+ 		open->op_createmode = be32_to_cpup(p++);
+ 		switch (open->op_createmode) {
+@@ -936,7 +934,7 @@ nfsd4_decode_open(struct nfsd4_compoundargs *argp, struct nfsd4_open *open)
+ 		case NFS4_CREATE_GUARDED:
+ 			status = nfsd4_decode_fattr(argp, open->op_bmval,
+ 				&open->op_iattr, &open->op_acl, &open->op_label,
+-				&current->fs->umask);
++				&open->op_umask);
+ 			if (status)
+ 				goto out;
+ 			break;
+@@ -951,7 +949,7 @@ nfsd4_decode_open(struct nfsd4_compoundargs *argp, struct nfsd4_open *open)
+ 			COPYMEM(open->op_verf.data, NFS4_VERIFIER_SIZE);
+ 			status = nfsd4_decode_fattr(argp, open->op_bmval,
+ 				&open->op_iattr, &open->op_acl, &open->op_label,
+-				&current->fs->umask);
++				&open->op_umask);
+ 			if (status)
+ 				goto out;
+ 			break;
+diff --git a/bundle/fs/nfsd/nfsproc.c b/bundle/fs/nfsd/nfsproc.c
+index 354b6ae08..28a589343 100644
+--- a/bundle/fs/nfsd/nfsproc.c
++++ b/bundle/fs/nfsd/nfsproc.c
+@@ -815,7 +815,7 @@ nfserrno (int errno)
+ 		if (nfs_errtbl[i].syserr == errno)
+ 			return nfs_errtbl[i].nfserr;
+ 	}
+-	WARN(1, "nfsd: non-standard errno: %d\n", errno);
++	WARN_ONCE(1, "nfsd: non-standard errno: %d\n", errno);
+ 	return nfserr_io;
+ }
+ 
+diff --git a/bundle/fs/nfsd/state.h b/bundle/fs/nfsd/state.h
+index cb63d7c19..cb004b8a3 100644
+--- a/bundle/fs/nfsd/state.h
++++ b/bundle/fs/nfsd/state.h
+@@ -70,6 +70,7 @@ struct nfsd4_callback {
+ 	int cb_seq_status;
+ 	int cb_status;
+ 	bool cb_need_restart;
++	bool cb_holds_slot;
+ };
+ 
+ struct nfsd4_callback_ops {
+@@ -349,6 +350,7 @@ struct nfs4_client {
+ 	struct rpc_wait_queue	cl_cb_waitq;	/* backchannel callers may */
+ 						/* wait here for slots */
+ 	struct net		*net;
++	atomic_t		cl_cb_inflight;	/* Outstanding callbacks */
+ };
+ 
+ /* struct nfs4_client_reset
+diff --git a/bundle/fs/nfsd/vfs.c b/bundle/fs/nfsd/vfs.c
+index 0a2b5baba..586f2b943 100644
+--- a/bundle/fs/nfsd/vfs.c
++++ b/bundle/fs/nfsd/vfs.c
+@@ -1378,6 +1378,9 @@ nfsd_create(struct svc_rqst *rqstp, struct svc_fh *fhp,
+ 		goto out;
+ 	}
+ 
++	if (!IS_POSIXACL(dirp))
++		iap->ia_mode &= ~current_umask();
++
+ 	/*
+ 	 * Get the dir op function pointer.
+ 	 */
+@@ -1548,6 +1551,9 @@ do_nfsd_create(struct svc_rqst *rqstp, struct svc_fh *fhp,
+ 		goto out;
+ 	}
+ 
++	if (!IS_POSIXACL(dirp))
++		iap->ia_mode &= ~current_umask();
++
+ 	host_err = vfs_create(dirp, dchild, iap->ia_mode, true);
+ 	if (host_err < 0) {
+ 		fh_drop_write(fhp);
+diff --git a/bundle/fs/nfsd/xdr4.h b/bundle/fs/nfsd/xdr4.h
+index e6ebce0cc..614321d02 100644
+--- a/bundle/fs/nfsd/xdr4.h
++++ b/bundle/fs/nfsd/xdr4.h
+@@ -117,6 +117,7 @@ struct nfsd4_create {
+ 	} u;
+ 	u32		cr_bmval[3];        /* request */
+ 	struct iattr	cr_iattr;           /* request */
++	int		cr_umask;           /* request */
+ 	struct nfsd4_change_info  cr_cinfo; /* response */
+ 	struct nfs4_acl *cr_acl;
+ 	struct xdr_netobj cr_label;
+@@ -227,6 +228,7 @@ struct nfsd4_open {
+ 	u32		op_why_no_deleg;    /* response - DELEG_NONE_EXT only */
+ 	u32		op_create;     	    /* request */
+ 	u32		op_createmode;      /* request */
++	int		op_umask;           /* request */
+ 	u32		op_bmval[3];        /* request */
+ 	struct iattr	op_iattr;           /* UNCHECKED4, GUARDED4, EXCLUSIVE4_1 */
+ 	nfs4_verifier	op_verf __attribute__((aligned(32)));
+diff --git a/bundle/include/linux/nfs_fs.h b/bundle/include/linux/nfs_fs.h
+index 4a5990ea6..1845be40f 100644
+--- a/bundle/include/linux/nfs_fs.h
++++ b/bundle/include/linux/nfs_fs.h
+@@ -194,8 +194,6 @@ struct nfs_inode {
+ 	 * exclusively via direct or buffered IO.  The other mutex in the
+ 	 * semaphore is i_mutex:
+ 	 */
+-	atomic_t		parallel_io_count;
+-	struct mutex	parallel_io_mutex;
+ 	struct inode		vfs_inode;
+ };
+ 
+diff --git a/bundle/include/linux/sunrpc/auth.h b/bundle/include/linux/sunrpc/auth.h
+index 464c61afc..2a2cceb52 100644
+--- a/bundle/include/linux/sunrpc/auth.h
++++ b/bundle/include/linux/sunrpc/auth.h
+@@ -13,7 +13,6 @@
+ #include <linux/sunrpc/sched.h>
+ #include <linux/sunrpc/msg_prot.h>
+ #include <linux/sunrpc/xdr.h>
+-#include <linux/sunrpc/groups.h>
+ 
+ #include <linux/atomic.h>
+ #include <linux/refcount.h>
+@@ -33,12 +32,12 @@
+  */
+ #define UNX_MAXNODENAME	__NEW_UTS_LEN
+ #define UNX_CALLSLACK	(21 + XDR_QUADLEN(UNX_MAXNODENAME))
++#define UNX_NGROUPS	16
+ 
+ struct rpcsec_gss_info;
+ 
+ struct auth_cred {
+ 	const struct cred *cred;
+-	struct rpc_groups rg;
+ 	const char *principal;	/* If present, this is a machine credential */
+ };
+ 
+@@ -162,7 +161,7 @@ int			rpcauth_get_gssinfo(rpc_authflavor_t,
+ 				struct rpcsec_gss_info *);
+ struct rpc_cred *	rpcauth_lookup_credcache(struct rpc_auth *, struct auth_cred *, int, gfp_t);
+ void			rpcauth_init_cred(struct rpc_cred *, const struct auth_cred *, struct rpc_auth *, const struct rpc_credops *);
+-struct rpc_cred *	rpcauth_lookupcred(struct rpc_auth *, struct rpc_groups *, int);
++struct rpc_cred *	rpcauth_lookupcred(struct rpc_auth *, int);
+ void			put_rpccred(struct rpc_cred *);
+ int			rpcauth_marshcred(struct rpc_task *task,
+ 					  struct xdr_stream *xdr);
+diff --git a/bundle/include/linux/sunrpc/groups.h b/bundle/include/linux/sunrpc/groups.h
+deleted file mode 100644
+index e4da9fb9f..000000000
+--- a/bundle/include/linux/sunrpc/groups.h
++++ /dev/null
+@@ -1,21 +0,0 @@
+-/* SPDX-License-Identifier: GPL-2.0 */
+-/*
+- * linux/include/linux/sunrpc/groups.h
+- *
+- * Handling for Unix groups
+- */
+-
+-#ifndef _LINUX_SUNRPC_GROUPS_H
+-#define _LINUX_SUNRPC_GROUPS_H
+-
+-#include <linux/atomic.h>
+-#include <linux/uidgid.h>
+-
+-#define UNX_NGROUPS	16
+-
+-struct rpc_groups {
+-	int	ngroups;
+-	kgid_t	groups[UNX_NGROUPS];
+-};
+-
+-#endif /* _LINUX_SUNRPC_GROUPS_H */
+diff --git a/bundle/include/linux/sunrpc/sched.h b/bundle/include/linux/sunrpc/sched.h
+index 56e83c6d0..bbcefd3f5 100644
+--- a/bundle/include/linux/sunrpc/sched.h
++++ b/bundle/include/linux/sunrpc/sched.h
+@@ -16,7 +16,6 @@
+ #include <linux/spinlock.h>
+ #include <linux/workqueue.h>
+ #include <linux/sunrpc/xdr.h>
+-#include <linux/sunrpc/groups.h>
+ 
+ /*
+  * This is the actual RPC procedure call info.
+@@ -27,7 +26,6 @@ struct rpc_message {
+ 	void *			rpc_argp;	/* Arguments */
+ 	void *			rpc_resp;	/* Result */
+ 	const struct cred *	rpc_cred;	/* Credentials */
+-	struct rpc_groups       rpc_groups;     /* Groups filter */
+ };
+ 
+ struct rpc_call_ops;
+diff --git a/bundle/include/trace/events/sunrpc.h b/bundle/include/trace/events/sunrpc.h
+index c20caa6c1..14cb1977c 100644
+--- a/bundle/include/trace/events/sunrpc.h
++++ b/bundle/include/trace/events/sunrpc.h
+@@ -725,105 +725,6 @@ TRACE_EVENT(rpc_stats_latency,
+ 		__entry->backlog, __entry->rtt, __entry->execute)
+ );
+ 
+-# define TRACE_READ_KGID(rg,i) \
+-    ((i) < (rg)->ngroups ? (int)from_kgid(&init_user_ns, (rg)->groups[i]) : -1)
+-
+-TRACE_EVENT(rpc_task_auth_group_trimmed,
+-	TP_PROTO(
+-		const struct rpc_task *task,
+-		struct rpc_groups *rg,
+-		int n,
+-		struct auth_cred *acred
+-	),
+-
+-	TP_ARGS(task, rg, n, acred),
+-
+-	TP_STRUCT__entry(
+-		__field(unsigned int, task_id)
+-		__field(unsigned int, client_id)
+-		__field(u32, xid)
+-		__field(int, version)
+-		__string(progname, task->tk_client->cl_program->name)
+-		__string(procname, rpc_proc_name(task))
+-		__field(int, rg_ngroups)
+-		__field(int, rg_gid0)
+-		__field(int, rg_gid1)
+-		__field(int, rg_gid2)
+-		__field(int, acred_ngroups)
+-		__field(int, acred_gid0)
+-		__field(int, acred_gid1)
+-		__field(int, acred_gid2)
+-	),
+-
+-	TP_fast_assign(
+-		if (task) {
+-		       __entry->client_id = task->tk_client->cl_clid;
+-		       __entry->task_id = task->tk_pid;
+-		       __entry->xid = be32_to_cpu(task->tk_rqstp->rq_xid);
+-	 	       __entry->version = task->tk_client->cl_vers;
+-		       __assign_str(progname, task->tk_client->cl_program->name)
+-		       __assign_str(procname, rpc_proc_name(task))
+-		} else {
+-		       __entry->client_id = 0;
+-		       __entry->task_id = 0;
+-		       __entry->xid = 0;
+-	 	       __entry->version = 0;
+-		       __assign_str(progname, "-")
+-		       __assign_str(procname, "-")
+-		}
+-		__entry->rg_ngroups = rg->ngroups;
+-		__entry->rg_gid0 = TRACE_READ_KGID(rg, 0);
+-		__entry->rg_gid1 = TRACE_READ_KGID(rg, 1);
+-		__entry->rg_gid2 = TRACE_READ_KGID(rg, 2);
+-		__entry->acred_ngroups = n;
+-		__entry->acred_gid0 = TRACE_READ_KGID(&acred->rg, 0);
+-		__entry->acred_gid1 = TRACE_READ_KGID(&acred->rg, 1);
+-		__entry->acred_gid2 = TRACE_READ_KGID(&acred->rg, 2);
+-	),
+-
+-	TP_printk("task:%u@%d xid=0x%08x %sv%d %s rg %d{%d,%d,%d} acred %d{%d,%d,%d}",
+-		__entry->task_id, __entry->client_id, __entry->xid,
+-		__get_str(progname), __entry->version, __get_str(procname),
+-		__entry->rg_ngroups, __entry->rg_gid0, __entry->rg_gid1, __entry->rg_gid2,
+-		__entry->acred_ngroups, __entry->acred_gid0, __entry->acred_gid1, __entry->acred_gid2)
+-);
+-
+-TRACE_EVENT(rpc_auth_group_trimmed,
+-	TP_PROTO(
+-		struct rpc_groups *rg,
+-		int n,
+-		struct auth_cred *acred
+-	),
+-
+-	TP_ARGS(rg, n, acred),
+-
+-	TP_STRUCT__entry(
+-		__field(int, rg_ngroups)
+-		__field(int, rg_gid0)
+-		__field(int, rg_gid1)
+-		__field(int, rg_gid2)
+-		__field(int, acred_ngroups)
+-		__field(int, acred_gid0)
+-		__field(int, acred_gid1)
+-		__field(int, acred_gid2)
+-	),
+-
+-	TP_fast_assign(
+-		__entry->rg_ngroups = rg->ngroups;
+-		__entry->rg_gid0 = TRACE_READ_KGID(rg, 0);
+-		__entry->rg_gid1 = TRACE_READ_KGID(rg, 1);
+-		__entry->rg_gid2 = TRACE_READ_KGID(rg, 2);
+-		__entry->acred_ngroups = n;
+-		__entry->acred_gid0 = TRACE_READ_KGID(&acred->rg, 0);
+-		__entry->acred_gid1 = TRACE_READ_KGID(&acred->rg, 1);
+-		__entry->acred_gid2 = TRACE_READ_KGID(&acred->rg, 2);
+-	),
+-
+-	TP_printk("%d{%d,%d,%d} acred %d{%d,%d,%d}",
+-		__entry->rg_ngroups, __entry->rg_gid0, __entry->rg_gid1, __entry->rg_gid2,
+-		__entry->acred_ngroups, __entry->acred_gid0, __entry->acred_gid1, __entry->acred_gid2)
+-);
+-
+ TRACE_EVENT(rpc_xdr_overflow,
+ 	TP_PROTO(
+ 		const struct xdr_stream *xdr,
+diff --git a/bundle/net/sunrpc/auth.c b/bundle/net/sunrpc/auth.c
+index 541079efb..bdb12cf55 100644
+--- a/bundle/net/sunrpc/auth.c
++++ b/bundle/net/sunrpc/auth.c
+@@ -18,19 +18,9 @@
+ #include <linux/sunrpc/gss_api.h>
+ #include <linux/spinlock.h>
+ #include <linux/old-kernel.h>
+-#include <linux/user_namespace.h>
+ 
+ #include <trace/events/sunrpc.h>
+ 
+-#if IS_ENABLED(CONFIG_SUNRPC_DEBUG)
+-# define RPCDBG_FACILITY	RPCDBG_AUTH
+-#endif
+-
+-#if IS_ENABLED(CONFIG_SUNRPC_DEBUG)
+-# define RG(rg,i)		((i) < (rg).ngroups ? (int)from_kgid(&init_user_ns, (rg).groups[i]) : -1)
+-#endif
+-
+-static void rpcauth_add_groups(struct rpc_task *task, struct auth_cred *acred, struct rpc_groups *rg);
+ 
+ #define RPC_CREDCACHE_DEFAULT_HASHBITS	(4)
+ struct rpc_cred_cache {
+@@ -591,8 +581,7 @@ out:
+ EXPORT_SYMBOL_GPL(rpcauth_lookup_credcache);
+ 
+ struct rpc_cred *
+-rpcauth_task_lookupcred(struct rpc_task *task,
+-			struct rpc_auth *auth, struct rpc_groups *rg, int flags)
++rpcauth_lookupcred(struct rpc_auth *auth, int flags)
+ {
+ 	struct auth_cred acred;
+ 	struct rpc_cred *ret;
+@@ -600,18 +589,9 @@ rpcauth_task_lookupcred(struct rpc_task *task,
+ 
+ 	memset(&acred, 0, sizeof(acred));
+ 	acred.cred = cred;
+-	rpcauth_add_groups(task, &acred, rg);
+ 	ret = auth->au_ops->lookup_cred(auth, &acred, flags);
+-
+-	dprintk("RPC:      cred %p\n", ret);
+ 	return ret;
+ }
+-
+-struct rpc_cred *
+-rpcauth_lookupcred(struct rpc_auth *auth, struct rpc_groups *rg, int flags)
+-{
+-	return rpcauth_task_lookupcred(NULL, auth, rg, flags);
+-}
+ EXPORT_SYMBOL_GPL(rpcauth_lookupcred);
+ 
+ void
+@@ -622,6 +602,7 @@ rpcauth_init_cred(struct rpc_cred *cred, const struct auth_cred *acred,
+ 	INIT_LIST_HEAD(&cred->cr_lru);
+ 	refcount_set(&cred->cr_count, 1);
+ 	cred->cr_auth = auth;
++	cred->cr_flags = 0;
+ 	cred->cr_ops = ops;
+ 	cred->cr_expire = jiffies;
+ 	cred->cr_cred = get_cred(acred->cred);
+@@ -682,16 +663,15 @@ rpcauth_bind_machine_cred(struct rpc_task *task, int lookupflags)
+ }
+ 
+ static struct rpc_cred *
+-rpcauth_bind_new_cred(struct rpc_task *task, struct rpc_groups *rg, int lookupflags)
++rpcauth_bind_new_cred(struct rpc_task *task, int lookupflags)
+ {
+ 	struct rpc_auth *auth = task->tk_client->cl_auth;
+ 
+-	return rpcauth_lookupcred(auth, rg, lookupflags);
++	return rpcauth_lookupcred(auth, lookupflags);
+ }
+ 
+ static int
+-rpcauth_bindcred(struct rpc_task *task, const struct cred *cred,
+-		 struct rpc_groups *rg, int flags)
++rpcauth_bindcred(struct rpc_task *task, const struct cred *cred, int flags)
+ {
+ 	struct rpc_rqst *req = task->tk_rqstp;
+ 	struct rpc_cred *new = NULL;
+@@ -706,10 +686,9 @@ rpcauth_bindcred(struct rpc_task *task, const struct cred *cred,
+ 	if (task->tk_op_cred)
+ 		/* Task must use exactly this rpc_cred */
+ 		new = get_rpccred(task->tk_op_cred);
+-	else if (cred != NULL && cred != &machine_cred) {
+-		rpcauth_add_groups(task, &acred, rg);
++	else if (cred != NULL && cred != &machine_cred)
+ 		new = auth->au_ops->lookup_cred(auth, &acred, lookupflags);
+-	} else if (cred == &machine_cred)
++	else if (cred == &machine_cred)
+ 		new = rpcauth_bind_machine_cred(task, lookupflags);
+ 
+ 	/* If machine cred couldn't be bound, try a root cred */
+@@ -720,7 +699,7 @@ rpcauth_bindcred(struct rpc_task *task, const struct cred *cred,
+ 	else if (flags & RPC_TASK_NULLCREDS)
+ 		new = authnull_ops.lookup_cred(NULL, NULL, 0);
+ 	else
+-		new = rpcauth_bind_new_cred(task, rg, lookupflags);
++		new = rpcauth_bind_new_cred(task, lookupflags);
+ 	if (IS_ERR(new))
+ 		return PTR_ERR(new);
+ 	put_rpccred(req->rq_cred);
+@@ -728,47 +707,6 @@ rpcauth_bindcred(struct rpc_task *task, const struct cred *cred,
+ 	return 0;
+ }
+ 
+-/*
+- * Generic function for adding groups to acred. When there are too many then
+- * try to be smart by picking only the relevant ones from our secondary group list.
+- */
+-static void rpcauth_add_groups(struct rpc_task *task, struct auth_cred *acred, struct rpc_groups *rg)
+-{
+-	int i, n, ngroups;
+-	kgid_t gid;
+-	const struct cred *cred = current_cred();
+-
+-	ngroups = cred->group_info->ngroups;
+-
+-	n = ngroups;
+-	if (n <= UNX_NGROUPS)
+-		rg = NULL;
+-	else
+-		n = UNX_NGROUPS;	/* too many groups for AUTH_UNIX */
+-	if (rg) {
+-		n = 0;	/* pick the few relevant groups we're a member of */
+-		for (i = 0; i < rg->ngroups; ++i) {
+-			gid = rg->groups[i];
+-			if (in_group_p(gid))
+-				acred->rg.groups[n++] = gid;
+-		}
+-		acred->rg.ngroups = n;
+-		if (task) {
+-			trace_rpc_task_auth_group_trimmed(task, rg, n, acred);
+-		} else {
+-			trace_rpc_auth_group_trimmed(rg, n, acred);
+-		}
+-		dprintk("RPC:      %s(): rg=%d:%d,%d,%d -> %d:%d,%d,%d\n", __func__,
+-			rg->ngroups, RG(*rg, 0), RG(*rg, 1), RG(*rg, 2),
+-			n, RG(acred->rg, 0), RG(acred->rg, 1), RG(acred->rg, 2));
+-	} else {
+-		dprintk("RPC:      %s(): ngroups=%d\n", __func__, ngroups);
+-		for (i = 0; i < n; ++i)
+-			acred->rg.groups[i] = GROUP_AT(cred->group_info, i);
+-		acred->rg.ngroups = n;
+-	}
+-}
+-
+ void
+ put_rpccred(struct rpc_cred *cred)
+ {
+@@ -916,11 +854,7 @@ rpcauth_refreshcred(struct rpc_task *task)
+ 
+ 	cred = task->tk_rqstp->rq_cred;
+ 	if (cred == NULL) {
+-		struct rpc_groups *rg = &task->tk_msg.rpc_groups;
+-		if (rg->ngroups == 0)
+-			rg = NULL;
+-		err = rpcauth_bindcred(task, task->tk_msg.rpc_cred, rg,
+-				       task->tk_flags);
++		err = rpcauth_bindcred(task, task->tk_msg.rpc_cred, task->tk_flags);
+ 		if (err < 0)
+ 			goto out;
+ 		cred = task->tk_rqstp->rq_cred;
+diff --git a/bundle/net/sunrpc/auth_unix.c b/bundle/net/sunrpc/auth_unix.c
+index 528dff654..28fbc8393 100644
+--- a/bundle/net/sunrpc/auth_unix.c
++++ b/bundle/net/sunrpc/auth_unix.c
+@@ -11,15 +11,11 @@
+ #include <linux/types.h>
+ #include <linux/sched.h>
+ #include <linux/module.h>
++#include <linux/mempool.h>
+ #include <linux/sunrpc/clnt.h>
+ #include <linux/sunrpc/auth.h>
+ #include <linux/user_namespace.h>
+ 
+-struct unx_cred {
+-	struct rpc_cred		uc_base;
+-	kgid_t			uc_gid;
+-	kgid_t			uc_gids[UNX_NGROUPS];
+-};
+ 
+ #if IS_ENABLED(CONFIG_SUNRPC_DEBUG)
+ # define RPCDBG_FACILITY	RPCDBG_AUTH
+@@ -27,6 +23,7 @@ struct unx_cred {
+ 
+ static struct rpc_auth		unix_auth;
+ static const struct rpc_credops	unix_credops;
++static mempool_t		*unix_pool;
+ 
+ static struct rpc_auth *
+ unx_create(const struct rpc_auth_create_args *args, struct rpc_clnt *clnt)
+@@ -38,16 +35,6 @@ unx_create(const struct rpc_auth_create_args *args, struct rpc_clnt *clnt)
+ static void
+ unx_destroy(struct rpc_auth *auth)
+ {
+-	dprintk("RPC:       destroying UNIX authenticator %p\n", auth);
+-	rpcauth_clear_credcache(auth->au_credcache);
+-}
+-
+-static int
+-unx_hash_cred(struct auth_cred *acred, unsigned int hashbits)
+-{
+-	return hash_64(from_kgid(&init_user_ns, acred->cred->fsgid) |
+-		((u64)from_kuid(&init_user_ns, acred->cred->fsuid) <<
+-			(sizeof(gid_t) * 8)), hashbits);
+ }
+ 
+ /*
+@@ -56,53 +43,20 @@ unx_hash_cred(struct auth_cred *acred, unsigned int hashbits)
+ static struct rpc_cred *
+ unx_lookup_cred(struct rpc_auth *auth, struct auth_cred *acred, int flags)
+ {
+-	return rpcauth_lookup_credcache(auth, acred, flags, GFP_NOFS);
+-}
+-
+-static struct rpc_cred *
+-unx_create_cred(struct rpc_auth *auth, struct auth_cred *acred, int flags, gfp_t gfp)
+-{
+-	struct unx_cred	*cred;
+-	unsigned int groups = acred->rg.ngroups;
+-	unsigned int i;
+-
+-	dprintk("RPC:       allocating UNIX cred for uid %d gid %d\n",
+-			from_kuid(&init_user_ns, acred->cred->fsuid),
+-			from_kgid(&init_user_ns, acred->cred->fsgid));
+-
+-	dprintk("RPC:       allocating UNIX cred for uid %d gid %d\n",
+-			from_kuid(&init_user_ns, acred->cred->fsuid),
+-			from_kgid(&init_user_ns, acred->cred->fsgid));
+-
+-	if (!(cred = kmalloc(sizeof(*cred), gfp)))
+-		return ERR_PTR(-ENOMEM);
++	struct rpc_cred *ret = mempool_alloc(unix_pool, GFP_NOFS);
+ 
+-	rpcauth_init_cred(&cred->uc_base, acred, auth, &unix_credops);
+-	cred->uc_base.cr_flags = 1UL << RPCAUTH_CRED_UPTODATE;
+-
+-	cred->uc_gid = acred->cred->fsgid;
+-	for (i = 0; i < groups; i++)
+-		cred->uc_gids[i] = acred->rg.groups[i];
+-	if (i < UNX_NGROUPS)
+-		cred->uc_gids[i] = INVALID_GID;
+-
+-	return &cred->uc_base;
+-}
+-
+-static void
+-unx_free_cred(struct unx_cred *unx_cred)
+-{
+-	dprintk("RPC:       unx_free_cred %p\n", unx_cred);
+-	put_cred(unx_cred->uc_base.cr_cred);
+-	kfree(unx_cred);
++	rpcauth_init_cred(ret, acred, auth, &unix_credops);
++	ret->cr_flags = 1UL << RPCAUTH_CRED_UPTODATE;
++	return ret;
+ }
+ 
+ static void
+ unx_free_cred_callback(struct rcu_head *head)
+ {
+-	struct unx_cred *unx_cred = container_of(head, struct unx_cred, uc_base.cr_rcu);
+-	dprintk("RPC:       unx_free_cred %p\n", unx_cred);
+-	unx_free_cred(unx_cred);
++	struct rpc_cred *rpc_cred = container_of(head, struct rpc_cred, cr_rcu);
++
++	put_cred(rpc_cred->cr_cred);
++	mempool_free(rpc_cred, unix_pool);
+ }
+ 
+ static void
+@@ -112,25 +66,32 @@ unx_destroy_cred(struct rpc_cred *cred)
+ }
+ 
+ /*
+- * Match credentials against current process creds.
+- * The root_override argument takes care of cases where the caller may
+- * request root creds (e.g. for NFS swapping).
++ * Match credentials against current the auth_cred.
+  */
+ static int
+-unx_match(struct auth_cred *acred, struct rpc_cred *rcred, int flags)
++unx_match(struct auth_cred *acred, struct rpc_cred *cred, int flags)
+ {
+-	struct unx_cred	*cred = container_of(rcred, struct unx_cred, uc_base);
+-	unsigned int groups = acred->rg.ngroups;
++	unsigned int groups = 0;
+ 	unsigned int i;
+ 
+-	if (!uid_eq(cred->uc_base.cr_cred->fsuid, acred->cred->fsuid) || !gid_eq(cred->uc_gid, acred->cred->fsgid))
++	if (cred->cr_cred == acred->cred)
++		return 1;
++
++	if (!uid_eq(cred->cr_cred->fsuid, acred->cred->fsuid) || !gid_eq(cred->cr_cred->fsgid, acred->cred->fsgid))
++		return 0;
++
++	if (acred->cred->group_info != NULL)
++		groups = acred->cred->group_info->ngroups;
++	if (groups > UNX_NGROUPS)
++		groups = UNX_NGROUPS;
++	if (cred->cr_cred->group_info == NULL)
++		return groups == 0;
++	if (groups != cred->cr_cred->group_info->ngroups)
+ 		return 0;
+ 
+ 	for (i = 0; i < groups ; i++)
+-		if (!gid_eq(cred->uc_gids[i], acred->rg.groups[i]))
++		if (!gid_eq(GROUP_AT(cred->cr_cred->group_info, i), GROUP_AT(acred->cred->group_info, i)))
+ 			return 0;
+-	if (groups < UNX_NGROUPS && gid_valid(cred->uc_gids[groups]))
+-		return 0;
+ 	return 1;
+ }
+ 
+@@ -142,9 +103,10 @@ static int
+ unx_marshal(struct rpc_task *task, struct xdr_stream *xdr)
+ {
+ 	struct rpc_clnt	*clnt = task->tk_client;
+-	struct unx_cred	*cred = container_of(task->tk_rqstp->rq_cred, struct unx_cred, uc_base);
++	struct rpc_cred	*cred = task->tk_rqstp->rq_cred;
+ 	__be32		*p, *cred_len, *gidarr_len;
+ 	int		i;
++	struct group_info *gi = cred->cr_cred->group_info;
+ 	struct user_namespace *userns = clnt->cl_cred ?
+ 		clnt->cl_cred->user_ns : &init_user_ns;
+ 
+@@ -162,13 +124,13 @@ unx_marshal(struct rpc_task *task, struct xdr_stream *xdr)
+ 	p = xdr_reserve_space(xdr, 3 * sizeof(*p));
+ 	if (!p)
+ 		goto marshal_failed;
+-	*p++ = cpu_to_be32(from_kuid_munged(userns, cred->uc_base.cr_cred->fsuid));
+-	*p++ = cpu_to_be32(from_kgid_munged(userns, cred->uc_gid));
++	*p++ = cpu_to_be32(from_kuid_munged(userns, cred->cr_cred->fsuid));
++	*p++ = cpu_to_be32(from_kgid_munged(userns, cred->cr_cred->fsgid));
+ 
+ 	gidarr_len = p++;
+-	for (i = 0; i < UNX_NGROUPS && gid_valid(cred->uc_gids[i]); i++)
+-		*p++ = htonl((u32) from_kgid(&init_user_ns, cred->uc_gids[i]));
+-
++	if (gi)
++		for (i = 0; i < UNX_NGROUPS && i < gi->ngroups; i++)
++			*p++ = cpu_to_be32(from_kgid_munged(userns, GROUP_AT(gi, i)));
+ 	*gidarr_len = cpu_to_be32(p - gidarr_len - 1);
+ 	*cred_len = cpu_to_be32((p - cred_len - 1) << 2);
+ 	p = xdr_reserve_space(xdr, (p - gidarr_len - 1) << 2);
+@@ -232,12 +194,13 @@ unx_validate(struct rpc_task *task, struct xdr_stream *xdr)
+ 
+ int __init rpc_init_authunix(void)
+ {
+-	return rpcauth_init_credcache(&unix_auth);
++	unix_pool = mempool_create_kmalloc_pool(16, sizeof(struct rpc_cred));
++	return unix_pool ? 0 : -ENOMEM;
+ }
+ 
+ void rpc_destroy_authunix(void)
+ {
+-	rpcauth_destroy_credcache(&unix_auth);
++	mempool_destroy(unix_pool);
+ }
+ 
+ const struct rpc_authops authunix_ops = {
+@@ -246,9 +209,7 @@ const struct rpc_authops authunix_ops = {
+ 	.au_name	= "UNIX",
+ 	.create		= unx_create,
+ 	.destroy	= unx_destroy,
+-	.hash_cred	= unx_hash_cred,
+ 	.lookup_cred	= unx_lookup_cred,
+-	.crcreate	= unx_create_cred,
+ };
+ 
+ static
+diff --git a/bundle/net/sunrpc/clnt.c b/bundle/net/sunrpc/clnt.c
+index 8dd63751e..0b929af1b 100644
+--- a/bundle/net/sunrpc/clnt.c
++++ b/bundle/net/sunrpc/clnt.c
+@@ -1473,16 +1473,12 @@ static void
+ rpc_task_set_rpc_message(struct rpc_task *task, const struct rpc_message *msg)
+ {
+ 	if (msg != NULL) {
+-		const struct rpc_groups *rg = &msg->rpc_groups;
+-
+ 		task->tk_msg.rpc_proc = msg->rpc_proc;
+ 		task->tk_msg.rpc_argp = msg->rpc_argp;
+ 		task->tk_msg.rpc_resp = msg->rpc_resp;
+ 		task->tk_msg.rpc_cred = msg->rpc_cred;
+ 		if (!(task->tk_flags & RPC_TASK_CRED_NOREF))
+ 			get_cred(task->tk_msg.rpc_cred);
+-		if (rg->ngroups != 0)
+-			task->tk_msg.rpc_groups = *rg;
+ 	}
+ }
+ 

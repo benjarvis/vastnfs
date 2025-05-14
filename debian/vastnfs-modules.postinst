@@ -1,0 +1,16 @@
+#!/bin/bash
+
+set -e
+
+if [[ "${VASTNFS_DEPMOD_RUN:-}" == "n" ]] ; then
+    echo "Skipping depmod run"
+    exit 0
+fi
+
+echo "Running depmod"
+
+kernel=$(cat /usr/share/vastnfs/build-info.txt | grep Kernel: | awk '{print $2}')
+
+echo "Built for kernel ${kernel}"
+
+/sbin/depmod ${kernel}

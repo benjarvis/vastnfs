@@ -1,0 +1,923 @@
+diff --git a/.gitignore b/.gitignore
+index fd214d041..6daa10e26 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -6,9 +6,12 @@
+ /.ofa-kernel/
+ /.tmp-bundle/
+ /.commit-msg
+-/.cache.mk
++.cache.mk
+ /.tmp_versions/
+ /.ofa_kernel/
+ /Module.symvers
+ /modules.order
+ /build-info.txt
++/compat.h
++/compat-after.h
++/compat.env
+diff --git a/bundle/fs/lockd/host.c b/bundle/fs/lockd/host.c
+index a9dab43dd..b291e632a 100644
+--- a/bundle/fs/lockd/host.c
++++ b/bundle/fs/lockd/host.c
+@@ -429,12 +429,7 @@ nlm_bind_host(struct nlm_host *host)
+ 	 * RPC rebind is required
+ 	 */
+ 	if ((clnt = host->h_rpcclnt) != NULL) {
+-		if (time_after_eq(jiffies, host->h_nextrebind)) {
+-			rpc_force_rebind(clnt);
+-			host->h_nextrebind = jiffies + NLM_HOST_REBIND;
+-			dprintk("lockd: next rebind in %lu jiffies\n",
+-					host->h_nextrebind - jiffies);
+-		}
++		nlm_rebind_host(host);
+ 	} else {
+ 		unsigned long increment = nlmsvc_timeout;
+ 		struct rpc_timeout timeparms = {
+@@ -483,13 +478,20 @@ nlm_bind_host(struct nlm_host *host)
+ 	return clnt;
+ }
+ 
+-/*
+- * Force a portmap lookup of the remote lockd port
++/**
++ * nlm_rebind_host - If needed, force a portmap lookup of the peer's lockd port
++ * @host: NLM host handle for peer
++ *
++ * This is not needed when using a connection-oriented protocol, such as TCP.
++ * The existing autobind mechanism is sufficient to force a rebind when
++ * required, e.g. on connection state transitions.
+  */
+ void
+ nlm_rebind_host(struct nlm_host *host)
+ {
+-	dprintk("lockd: rebind host %s\n", host->h_name);
++	if (host->h_proto != IPPROTO_UDP)
++		return;
++
+ 	if (host->h_rpcclnt && time_after_eq(jiffies, host->h_nextrebind)) {
+ 		rpc_force_rebind(host->h_rpcclnt);
+ 		host->h_nextrebind = jiffies + NLM_HOST_REBIND;
+diff --git a/bundle/fs/nfs/delegation.c b/bundle/fs/nfs/delegation.c
+index 178542f79..35be826a6 100644
+--- a/bundle/fs/nfs/delegation.c
++++ b/bundle/fs/nfs/delegation.c
+@@ -1010,6 +1010,18 @@ void nfs_mark_test_expired_all_delegations(struct nfs_client *clp)
+ 	rcu_read_unlock();
+ }
+ 
++/**
++ * nfs_test_expired_all_delegations - test all delegations for a client
++ * @clp: nfs_client to process
++ *
++ * Helper for handling "recallable state revoked" status from server.
++ */
++void nfs_test_expired_all_delegations(struct nfs_client *clp)
++{
++	nfs_mark_test_expired_all_delegations(clp);
++	nfs4_schedule_state_manager(clp);
++}
++
+ static void
+ nfs_delegation_test_free_expired(struct inode *inode,
+ 		nfs4_stateid *stateid,
+diff --git a/bundle/fs/nfs/delegation.h b/bundle/fs/nfs/delegation.h
+index 1e3f05800..670e30df6 100644
+--- a/bundle/fs/nfs/delegation.h
++++ b/bundle/fs/nfs/delegation.h
+@@ -55,6 +55,7 @@ void nfs_delegation_mark_reclaim(struct nfs_client *clp);
+ void nfs_delegation_reap_unclaimed(struct nfs_client *clp);
+ 
+ void nfs_mark_test_expired_all_delegations(struct nfs_client *clp);
++void nfs_test_expired_all_delegations(struct nfs_client *clp);
+ void nfs_reap_expired_delegations(struct nfs_client *clp);
+ 
+ /* NFSv4 delegation-related procedures */
+diff --git a/bundle/fs/nfs/dir.c b/bundle/fs/nfs/dir.c
+index 707c62319..af45bbcd5 100644
+--- a/bundle/fs/nfs/dir.c
++++ b/bundle/fs/nfs/dir.c
+@@ -605,6 +605,9 @@ int nfs_readdir_page_filler(nfs_readdir_descriptor_t *desc, struct nfs_entry *en
+ 	xdr_set_scratch_buffer(&stream, page_address(scratch), PAGE_SIZE);
+ 
+ 	do {
++		if (entry->label)
++			entry->label->len = NFS4_MAXLABELLEN;
++
+ 		status = xdr_decode(desc, entry, &stream);
+ 		if (status != 0) {
+ 			if (status == -EAGAIN)
+@@ -1246,7 +1249,7 @@ nfs_do_lookup_revalidate(struct inode *dir, struct dentry *dentry,
+ 			 unsigned int flags)
+ {
+ 	struct inode *inode;
+-	int error;
++	int error = 0;
+ 
+ 	nfs_inc_stats(dir, NFSIOS_DENTRYREVALIDATE);
+ 	inode = d_inode(dentry);
+@@ -1268,8 +1271,10 @@ nfs_do_lookup_revalidate(struct inode *dir, struct dentry *dentry,
+ 	    nfs_check_verifier(dir, dentry, flags & LOOKUP_RCU)) {
+ 		error = nfs_lookup_verify_inode(inode, flags);
+ 		if (error) {
+-			if (error == -ESTALE)
++			if (error == -ESTALE) {
+ 				nfs_zap_caches(dir);
++				error = 0;
++			}
+ 			goto out_bad;
+ 		}
+ 		nfs_advise_use_readdirplus(dir);
+@@ -1291,7 +1296,7 @@ out_valid:
+ out_bad:
+ 	if (flags & LOOKUP_RCU)
+ 		return -ECHILD;
+-	return nfs_lookup_revalidate_done(dir, dentry, inode, 0);
++	return nfs_lookup_revalidate_done(dir, dentry, inode, error);
+ }
+ 
+ static int
+diff --git a/bundle/fs/nfs/flexfilelayout/flexfilelayout.c b/bundle/fs/nfs/flexfilelayout/flexfilelayout.c
+index 47d4da59a..5db94fd7b 100644
+--- a/bundle/fs/nfs/flexfilelayout/flexfilelayout.c
++++ b/bundle/fs/nfs/flexfilelayout/flexfilelayout.c
+@@ -929,9 +929,8 @@ retry:
+ 		goto out_mds;
+ 
+ 	/* Use a direct mapping of ds_idx to pgio mirror_idx */
+-	if (WARN_ON_ONCE(pgio->pg_mirror_count !=
+-	    FF_LAYOUT_MIRROR_COUNT(pgio->pg_lseg)))
+-		goto out_mds;
++	if (pgio->pg_mirror_count != FF_LAYOUT_MIRROR_COUNT(pgio->pg_lseg))
++		goto out_eagain;
+ 
+ 	for (i = 0; i < pgio->pg_mirror_count; i++) {
+ 		ds = nfs4_ff_layout_prepare_ds(pgio->pg_lseg, i, true);
+@@ -950,11 +949,15 @@ retry:
+ 	}
+ 
+ 	return;
+-
++out_eagain:
++	pnfs_generic_pg_cleanup(pgio);
++	pgio->pg_error = -EAGAIN;
++	return;
+ out_mds:
+ 	pnfs_put_lseg(pgio->pg_lseg);
+ 	pgio->pg_lseg = NULL;
+ 	nfs_pageio_reset_write_mds(pgio);
++	pgio->pg_error = -EAGAIN;
+ }
+ 
+ static unsigned int
+diff --git a/bundle/fs/nfs/inode.c b/bundle/fs/nfs/inode.c
+index 54dcaa90b..390c273f6 100644
+--- a/bundle/fs/nfs/inode.c
++++ b/bundle/fs/nfs/inode.c
+@@ -2026,7 +2026,7 @@ static int nfsiod_start(void)
+ {
+ 	struct workqueue_struct *wq;
+ 	dprintk("RPC:       creating workqueue nfsiod\n");
+-	wq = alloc_workqueue("nfsiod", WQ_MEM_RECLAIM, 0);
++	wq = alloc_workqueue("nfsiod", WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
+ 	if (wq == NULL)
+ 		return -ENOMEM;
+ 	nfsiod_workqueue = wq;
+diff --git a/bundle/fs/nfs/internal.h b/bundle/fs/nfs/internal.h
+index 44fb77481..cd27a45bb 100644
+--- a/bundle/fs/nfs/internal.h
++++ b/bundle/fs/nfs/internal.h
+@@ -629,12 +629,14 @@ extern void nfs4_test_session_trunk(struct rpc_clnt *clnt,
+ 
+ static inline struct inode *nfs_igrab_and_active(struct inode *inode)
+ {
+-	inode = igrab(inode);
+-	if (inode != NULL && !nfs_sb_active(inode->i_sb)) {
+-		iput(inode);
+-		inode = NULL;
++	struct super_block *sb = inode->i_sb;
++
++	if (sb && nfs_sb_active(sb)) {
++		if (igrab(inode))
++			return inode;
++		nfs_sb_deactive(sb);
+ 	}
+-	return inode;
++	return NULL;
+ }
+ 
+ static inline void nfs_iput_and_deactive(struct inode *inode)
+diff --git a/bundle/fs/nfs/namespace.c b/bundle/fs/nfs/namespace.c
+index e5686be67..d57d453ae 100644
+--- a/bundle/fs/nfs/namespace.c
++++ b/bundle/fs/nfs/namespace.c
+@@ -30,9 +30,9 @@ int nfs_mountpoint_expiry_timeout = 500 * HZ;
+ /*
+  * nfs_path - reconstruct the path given an arbitrary dentry
+  * @base - used to return pointer to the end of devname part of path
+- * @dentry - pointer to dentry
++ * @dentry_in - pointer to dentry
+  * @buffer - result buffer
+- * @buflen - length of buffer
++ * @buflen_in - length of buffer
+  * @flags - options (see below)
+  *
+  * Helper function for constructing the server pathname
+@@ -47,15 +47,19 @@ int nfs_mountpoint_expiry_timeout = 500 * HZ;
+  *		       the original device (export) name
+  *		       (if unset, the original name is returned verbatim)
+  */
+-char *nfs_path(char **p, struct dentry *dentry, char *buffer, ssize_t buflen,
+-	       unsigned flags)
++char *nfs_path(char **p, struct dentry *dentry_in, char *buffer,
++	       ssize_t buflen_in, unsigned flags)
+ {
+ 	char *end;
+ 	int namelen;
+ 	unsigned seq;
+ 	const char *base;
++	struct dentry *dentry;
++	ssize_t buflen;
+ 
+ rename_retry:
++	buflen = buflen_in;
++	dentry = dentry_in;
+ 	end = buffer+buflen;
+ 	*--end = '\0';
+ 	buflen--;
+diff --git a/bundle/fs/nfs/nfs42proc.c b/bundle/fs/nfs/nfs42proc.c
+index 319a47db2..29f8d666f 100644
+--- a/bundle/fs/nfs/nfs42proc.c
++++ b/bundle/fs/nfs/nfs42proc.c
+@@ -185,7 +185,15 @@ static ssize_t _nfs42_proc_copy(struct file *src,
+ 
+ 	truncate_pagecache_range(dst_inode, pos_dst,
+ 				 pos_dst + res->write_res.count);
+-
++	spin_lock(&dst_inode->i_lock);
++	NFS_I(dst_inode)->cache_validity |= (NFS_INO_REVAL_PAGECACHE |
++			NFS_INO_REVAL_FORCED |
++			NFS_INO_INVALID_ATTR | NFS_INO_INVALID_DATA);
++	spin_unlock(&dst_inode->i_lock);
++	spin_lock(&file_inode(src)->i_lock);
++	NFS_I(file_inode(src))->cache_validity |= (NFS_INO_REVAL_PAGECACHE |
++			NFS_INO_REVAL_FORCED | NFS_INO_INVALID_ATIME);
++	spin_unlock(&file_inode(src)->i_lock);
+ 	status = res->write_res.count;
+ out:
+ 	kfree(res->commit_res.verf);
+diff --git a/bundle/fs/nfs/nfs4proc.c b/bundle/fs/nfs/nfs4proc.c
+index fa446c952..9191651d5 100644
+--- a/bundle/fs/nfs/nfs4proc.c
++++ b/bundle/fs/nfs/nfs4proc.c
+@@ -1517,6 +1517,7 @@ static void nfs_clear_open_stateid(struct nfs4_state *state,
+ static void nfs_set_open_stateid_locked(struct nfs4_state *state,
+ 		const nfs4_stateid *stateid, nfs4_stateid *freeme)
+ {
++	unsigned long deadline = jiffies + 5 * HZ;
+ 	DEFINE_WAIT(wait);
+ 	struct wait_queue_head *wq_head = bit_waitqueue(&state->flags,
+ 							NFS_STATE_CHANGE_WAIT);
+@@ -1543,7 +1544,8 @@ static void nfs_set_open_stateid_locked(struct nfs4_state *state,
+ 		spin_unlock(&state->owner->so_lock);
+ 		rcu_read_unlock();
+ 		if (!signal_pending(current)) {
+-			if (schedule_timeout(5*HZ) == 0)
++			if (schedule_timeout(5*HZ) == 0 ||
++			    time_after(jiffies, deadline))
+ 				status = -EAGAIN;
+ 			else
+ 				status = 0;
+@@ -4472,12 +4474,12 @@ static int _nfs4_proc_readdir(struct dentry *dentry, const struct cred *cred,
+ 		u64 cookie, struct page **pages, unsigned int count, int plus)
+ {
+ 	struct inode		*dir = d_inode(dentry);
++	struct nfs_server	*server = NFS_SERVER(dir);
+ 	struct nfs4_readdir_arg args = {
+ 		.fh = NFS_FH(dir),
+ 		.pages = pages,
+ 		.pgbase = 0,
+ 		.count = count,
+-		.bitmask = NFS_SERVER(d_inode(dentry))->attr_bitmask,
+ 		.plus = plus,
+ 	};
+ 	struct nfs4_readdir_res res;
+@@ -4492,9 +4494,15 @@ static int _nfs4_proc_readdir(struct dentry *dentry, const struct cred *cred,
+ 	dprintk("%s: dentry = %pd2, cookie = %Lu\n", __func__,
+ 			dentry,
+ 			(unsigned long long)cookie);
++	if (!(server->caps & NFS_CAP_SECURITY_LABEL))
++		args.bitmask = server->attr_bitmask_nl;
++	else
++		args.bitmask = server->attr_bitmask;
++
+ 	nfs4_setup_readdir(cookie, NFS_I(dir)->cookieverf, dentry, &args);
+ 	res.pgbase = args.pgbase;
+-	status = nfs4_call_sync(NFS_SERVER(dir)->client, NFS_SERVER(dir), &msg, &args.seq_args, &res.seq_res, 0);
++	status = nfs4_call_sync(server->client, server, &msg, &args.seq_args,
++			&res.seq_res, 0);
+ 	if (status >= 0) {
+ 		memcpy(NFS_I(dir)->cookieverf, res.verifier.data, NFS4_VERIFIER_SIZE);
+ 		status += args.pgbase;
+@@ -5347,8 +5355,6 @@ static int _nfs4_get_security_label(struct inode *inode, void *buf,
+ 		return ret;
+ 	if (!(fattr.valid & NFS_ATTR_FATTR_V4_SECURITY_LABEL))
+ 		return -ENOENT;
+-	if (buflen < label.len)
+-		return -ERANGE;
+ 	return 0;
+ }
+ 
+@@ -6440,9 +6446,9 @@ static int _nfs4_do_setlk(struct nfs4_state *state, int cmd, struct file_lock *f
+ 					data->arg.new_lock_owner, ret);
+ 	} else
+ 		data->cancelled = 1;
++	trace_nfs4_set_lock(fl, state, &data->res.stateid, cmd, ret);
+ 	rpc_put_task(task);
+ 	dprintk("%s: done, ret = %d!\n", __func__, ret);
+-	trace_nfs4_set_lock(fl, state, &data->res.stateid, cmd, ret);
+ 	return ret;
+ }
+ 
+@@ -7319,9 +7325,11 @@ int nfs4_proc_secinfo(struct inode *dir, const struct qstr *name,
+  * both PNFS and NON_PNFS flags set, and not having one of NON_PNFS, PNFS, or
+  * DS flags set.
+  */
+-static int nfs4_check_cl_exchange_flags(u32 flags)
++static int nfs4_check_cl_exchange_flags(u32 flags, u32 version)
+ {
+-	if (flags & ~EXCHGID4_FLAG_MASK_R)
++	if (version >= 2 && (flags & ~EXCHGID4_2_FLAG_MASK_R))
++		goto out_inval;
++	else if (version < 2 && (flags & ~EXCHGID4_FLAG_MASK_R))
+ 		goto out_inval;
+ 	if ((flags & EXCHGID4_FLAG_USE_PNFS_MDS) &&
+ 	    (flags & EXCHGID4_FLAG_USE_NON_PNFS))
+@@ -7345,6 +7353,15 @@ nfs41_same_server_scope(struct nfs41_server_scope *a,
+ static void
+ nfs4_bind_one_conn_to_session_done(struct rpc_task *task, void *calldata)
+ {
++	struct nfs41_bind_conn_to_session_args *args = task->tk_msg.rpc_argp;
++	struct nfs41_bind_conn_to_session_res *res = task->tk_msg.rpc_resp;
++
++	if (args->dir == NFS4_CDFC4_FORE_OR_BOTH &&
++			res->dir != NFS4_CDFS4_BOTH) {
++		rpc_task_close_connection(task);
++		if (args->retries++ < MAX_BIND_CONN_TO_SESSION_RETRIES)
++			rpc_restart_call(task);
++	}
+ }
+ 
+ static const struct rpc_call_ops nfs4_bind_one_conn_to_session_ops = {
+@@ -7367,6 +7384,7 @@ int nfs4_proc_bind_one_conn_to_session(struct rpc_clnt *clnt,
+ 	struct nfs41_bind_conn_to_session_args args = {
+ 		.client = clp,
+ 		.dir = NFS4_CDFC4_FORE_OR_BOTH,
++		.retries = 0,
+ 	};
+ 	struct nfs41_bind_conn_to_session_res res;
+ 	struct rpc_message msg = {
+@@ -7588,7 +7606,8 @@ static void nfs4_exchange_id_done(struct rpc_task *task, void *data)
+ 	trace_nfs4_exchange_id(clp, status);
+ 
+ 	if (status == 0)
+-		status = nfs4_check_cl_exchange_flags(cdata->res.flags);
++		status = nfs4_check_cl_exchange_flags(cdata->res.flags,
++						      clp->cl_mvops->minor_version);
+ 
+ 	if (cdata->xprt && status == 0) {
+ 		status = nfs4_detect_session_trunking(clp, &cdata->res,
+diff --git a/bundle/fs/nfs/nfs4state.c b/bundle/fs/nfs/nfs4state.c
+index a79c97b7b..ec257a4cb 100644
+--- a/bundle/fs/nfs/nfs4state.c
++++ b/bundle/fs/nfs/nfs4state.c
+@@ -2291,8 +2291,7 @@ static void nfs41_handle_recallable_state_revoked(struct nfs_client *clp)
+ {
+ 	/* FIXME: For now, we destroy all layouts. */
+ 	pnfs_destroy_all_layouts(clp);
+-	/* FIXME: For now, we test all delegations+open state+locks. */
+-	nfs41_handle_some_state_revoked(clp);
++	nfs_test_expired_all_delegations(clp);
+ 	dprintk("%s: Recallable state revoked on server %s!\n", __func__,
+ 			clp->cl_hostname);
+ }
+diff --git a/bundle/fs/nfs/nfs4xdr.c b/bundle/fs/nfs/nfs4xdr.c
+index ea211d263..21be6d371 100644
+--- a/bundle/fs/nfs/nfs4xdr.c
++++ b/bundle/fs/nfs/nfs4xdr.c
+@@ -4211,7 +4211,11 @@ static int decode_attr_security_label(struct xdr_stream *xdr, uint32_t *bitmap,
+ 			goto out_overflow;
+ 		if (len < NFS4_MAXLABELLEN) {
+ 			if (label) {
+-				memcpy(label->label, p, len);
++				if (label->len) {
++					if (label->len < len)
++						return -ERANGE;
++					memcpy(label->label, p, len);
++				}
+ 				label->len = len;
+ 				label->pi = pi;
+ 				label->lfs = lfs;
+diff --git a/bundle/fs/nfs/pnfs.c b/bundle/fs/nfs/pnfs.c
+index 38636c7d5..f40647511 100644
+--- a/bundle/fs/nfs/pnfs.c
++++ b/bundle/fs/nfs/pnfs.c
+@@ -1371,12 +1371,18 @@ void pnfs_roc_release(struct nfs4_layoutreturn_args *args,
+ 		int ret)
+ {
+ 	struct pnfs_layout_hdr *lo = args->layout;
++	struct inode *inode = args->inode;
+ 	const nfs4_stateid *arg_stateid = NULL;
+ 	const nfs4_stateid *res_stateid = NULL;
+ 	struct nfs4_xdr_opaque_data *ld_private = args->ld_private;
+ 
+ 	switch (ret) {
+ 	case -NFS4ERR_NOMATCHING_LAYOUT:
++		spin_lock(&inode->i_lock);
++		if (pnfs_layout_is_valid(lo) &&
++		    nfs4_stateid_match_other(&args->stateid, &lo->plh_stateid))
++			pnfs_set_plh_return_info(lo, args->range.iomode, 0);
++		spin_unlock(&inode->i_lock);
+ 		break;
+ 	case 0:
+ 		if (res->lrs_present)
+diff --git a/bundle/fs/nfs/write.c b/bundle/fs/nfs/write.c
+index 27332c322..4cb912a14 100644
+--- a/bundle/fs/nfs/write.c
++++ b/bundle/fs/nfs/write.c
+@@ -56,6 +56,7 @@ static const struct rpc_call_ops nfs_commit_ops;
+ static const struct nfs_pgio_completion_ops nfs_async_write_completion_ops;
+ static const struct nfs_commit_completion_ops nfs_commit_completion_ops;
+ static const struct nfs_rw_ops nfs_rw_write_ops;
++static void nfs_inode_remove_request(struct nfs_page *req);
+ static void nfs_clear_request_commit(struct nfs_page *req);
+ static void nfs_init_cinfo_from_inode(struct nfs_commit_info *cinfo,
+ 				      struct inode *inode);
+@@ -615,6 +616,8 @@ static void nfs_write_error_remove_page(struct nfs_page *req)
+ {
+ 	nfs_unlock_request(req);
+ 	SetPageError(req->wb_page);
++	nfs_set_pageerror(page_file_mapping(req->wb_page));
++	nfs_inode_remove_request(req);
+ 	nfs_end_page_writeback(req);
+ 	nfs_release_request(req);
+ }
+diff --git a/bundle/fs/nfsd/nfs3xdr.c b/bundle/fs/nfsd/nfs3xdr.c
+index d0970d87e..e84fc1187 100644
+--- a/bundle/fs/nfsd/nfs3xdr.c
++++ b/bundle/fs/nfsd/nfs3xdr.c
+@@ -810,9 +810,14 @@ compose_entry_fh(struct nfsd3_readdirres *cd, struct svc_fh *fhp,
+ 	if (isdotent(name, namlen)) {
+ 		if (namlen == 2) {
+ 			dchild = dget_parent(dparent);
+-			/* filesystem root - cannot return filehandle for ".." */
++			/*
++			 * Don't return filehandle for ".." if we're at
++			 * the filesystem or export root:
++			 */
+ 			if (dchild == dparent)
+ 				goto out;
++			if (dparent == exp->ex_path.dentry)
++				goto out;
+ 		} else
+ 			dchild = dget(dparent);
+ 	} else
+diff --git a/bundle/fs/nfsd/nfsproc.c b/bundle/fs/nfsd/nfsproc.c
+index de98cecea..f024d47c9 100644
+--- a/bundle/fs/nfsd/nfsproc.c
++++ b/bundle/fs/nfsd/nfsproc.c
+@@ -117,6 +117,13 @@ done:
+ 	return nfsd_return_attrs(nfserr, resp);
+ }
+ 
++/* Obsolete, replaced by MNTPROC_MNT. */
++static __be32
++nfsd_proc_root(struct svc_rqst *rqstp)
++{
++	return nfs_ok;
++}
++
+ /*
+  * Look up a path name component
+  * Note: the dentry in the resp->fh may be negative if the file
+@@ -200,6 +207,13 @@ nfsd_proc_read(struct svc_rqst *rqstp)
+ 	return fh_getattr(&resp->fh, &resp->stat);
+ }
+ 
++/* Reserved */
++static __be32
++nfsd_proc_writecache(struct svc_rqst *rqstp)
++{
++	return nfs_ok;
++}
++
+ /*
+  * Write data to a file
+  * N.B. After this call resp->fh needs an fh_put
+@@ -614,6 +628,7 @@ static struct svc_procedure		nfsd_procedures2[18] = {
+ 		.pc_xdrressize = ST+AT,
+ 	},
+ 	[NFSPROC_ROOT] = {
++		.pc_func = nfsd_proc_root,
+ 		.pc_decode = nfssvc_decode_void,
+ 		.pc_encode = nfssvc_encode_void,
+ 		.pc_argsize = sizeof(struct nfsd_void),
+@@ -651,6 +666,7 @@ static struct svc_procedure		nfsd_procedures2[18] = {
+ 		.pc_xdrressize = ST+AT+1+NFSSVC_MAXBLKSIZE_V2/4,
+ 	},
+ 	[NFSPROC_WRITECACHE] = {
++		.pc_func = nfsd_proc_writecache,
+ 		.pc_decode = nfssvc_decode_void,
+ 		.pc_encode = nfssvc_encode_void,
+ 		.pc_argsize = sizeof(struct nfsd_void),
+diff --git a/bundle/fs/nfsd/nfssvc.c b/bundle/fs/nfsd/nfssvc.c
+index c484c3447..a8c861db0 100644
+--- a/bundle/fs/nfsd/nfssvc.c
++++ b/bundle/fs/nfsd/nfssvc.c
+@@ -412,8 +412,7 @@ static void nfsd_last_thread(struct svc_serv *serv, struct net *net)
+ 		return;
+ 
+ 	nfsd_shutdown_net(net);
+-	printk(KERN_WARNING "nfsd: last server has exited, flushing export "
+-			    "cache\n");
++	pr_info("nfsd: last server has exited, flushing export cache\n");
+ 	nfsd_export_flush(net);
+ }
+ 
+diff --git a/bundle/include/linux/nfs_xdr.h b/bundle/include/linux/nfs_xdr.h
+index 73613dc38..9a65c6998 100644
+--- a/bundle/include/linux/nfs_xdr.h
++++ b/bundle/include/linux/nfs_xdr.h
+@@ -1245,11 +1245,13 @@ struct nfs41_impl_id {
+ 	struct nfstime4			date;
+ };
+ 
++#define MAX_BIND_CONN_TO_SESSION_RETRIES 3
+ struct nfs41_bind_conn_to_session_args {
+ 	struct nfs_client		*client;
+ 	struct nfs4_sessionid		sessionid;
+ 	u32				dir;
+ 	bool				use_conn_in_rdma_mode;
++	int				retries;
+ };
+ 
+ struct nfs41_bind_conn_to_session_res {
+diff --git a/bundle/net/sunrpc/xprtrdma/frwr_ops.c b/bundle/net/sunrpc/xprtrdma/frwr_ops.c
+index 696907953..593c20bcf 100644
+--- a/bundle/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/bundle/net/sunrpc/xprtrdma/frwr_ops.c
+@@ -54,6 +54,11 @@
+ 
+ #include "nvfs_wrap.h"
+ 
++#if defined(COMPAT_DETECT_IB_KERNEL_CAPS)
++/* e945c653c8e - RDMA: Split kernel-only global device caps from uverbs device caps */
++#define IB_DEVICE_SG_GAPS_REG IBK_SG_GAPS_REG
++#endif
++
+ static void frwr_mr_unmap(struct rpcrdma_xprt *r_xprt, struct rpcrdma_mr *mr)
+ {
+ 	if (mr->mr_device) {
+diff --git a/bundle/net/sunrpc/xprtsock.c b/bundle/net/sunrpc/xprtsock.c
+index 938701245..ffdf5bf76 100644
+--- a/bundle/net/sunrpc/xprtsock.c
++++ b/bundle/net/sunrpc/xprtsock.c
+@@ -3164,6 +3164,7 @@ void cleanup_socket_xprt(void)
+ 	xprt_unregister_transport(&xs_bc_tcp_transport);
+ }
+ 
++#if !defined(COMPAT_DETECT_PARAM_SET_UINT_MINMAX)
+ static int param_set_uint_minmax(const char *val,
+ 		const struct kernel_param *kp,
+ 		unsigned int min, unsigned int max)
+@@ -3181,6 +3182,7 @@ static int param_set_uint_minmax(const char *val,
+ 	*((unsigned int *)kp->arg) = num;
+ 	return 0;
+ }
++#endif
+ 
+ static int param_set_portnr(const char *val, const struct kernel_param *kp)
+ {
+diff --git a/compat/.gitignore b/compat/.gitignore
+new file mode 100644
+index 000000000..0d7aa7ccf
+--- /dev/null
++++ b/compat/.gitignore
+@@ -0,0 +1,15 @@
++built-in.a
++Module.symvers
++modules.order
++*.cmd
++.tmp_versions/
++*.o
++*.gcno
++*.ko
++.*.o.d
++*.mod.c
++*.mod
++errors.log
++Module.symvers
++export-errors.log
++/checks-export/
+diff --git a/compat/checks/.gitignore b/compat/checks/.gitignore
+new file mode 100644
+index 000000000..5fc607b9e
+--- /dev/null
++++ b/compat/checks/.gitignore
+@@ -0,0 +1 @@
++/Makefile
+diff --git a/compat/checks/ib_kernel_caps.c b/compat/checks/ib_kernel_caps.c
+new file mode 100644
+index 000000000..f82c795f5
+--- /dev/null
++++ b/compat/checks/ib_kernel_caps.c
+@@ -0,0 +1,9 @@
++#include <linux/module.h>
++#include <rdma/ib_verbs.h>
++
++int check_type(void)
++{
++	return IBK_SG_GAPS_REG;
++}
++
++MODULE_LICENSE("GPL");
+diff --git a/compat/checks/param_set_uint_minmax.c b/compat/checks/param_set_uint_minmax.c
+new file mode 100644
+index 000000000..f9199ac4e
+--- /dev/null
++++ b/compat/checks/param_set_uint_minmax.c
+@@ -0,0 +1,10 @@
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++
++int check_type(const char *val, const struct kernel_param *kp,
++	       unsigned int min, unsigned int max)
++{
++	return param_set_uint_minmax(val, kp, min, max);
++}
++
++MODULE_LICENSE("GPL");
+diff --git a/compat/collect-config b/compat/collect-config
+new file mode 100755
+index 000000000..31cc2ea5c
+--- /dev/null
++++ b/compat/collect-config
+@@ -0,0 +1,156 @@
++#!/bin/bash
++
++set -euo pipefail
++
++get-test-layer() {
++    set +e
++    local num=$(cat "$1" | grep 'LAYER:' | sed -E 's#/[*] LAYER: ([0-9]+) [*]/#\1#g')
++    set -e
++    if [[ "${num}" == "" ]] ; then
++	echo 1
++    else
++	echo ${num}
++    fi
++}
++
++list-srcs() {
++    local layer="$1"
++    cd checks
++    for i in *.c ; do
++	if [[ "$(get-test-layer ${i})" != "$layer" ]] ; then
++	    continue
++	fi
++	echo -n " " ${i%.c}.o
++    done
++    cd ..
++}
++
++run-build() {
++    local layer=${1}
++    shift
++    rm -f checks/Makefile checks/*.mod.c
++    echo "obj-m += $(list-srcs ${layer})" > checks/Makefile
++    cores=$(grep -c ^processor /proc/cpuinfo)
++    make -k -j${cores} "$@"  M=$(pwd)/checks 2>> errors.log || true
++}
++
++generate-config() {
++    set +u
++    local layer=${1}
++    shift || true
++    set -u
++
++    undefined_one() {
++	nm -C $@ | grep ' U ' | awk '{print $2}'
++    }
++
++    undefined_all_as_extern_asm() {
++	for i in checks/*.o ; do
++	    undefined_one ${i}  | awk '{print "\".quad " $1 "; \""}'
++	done
++    }
++
++    get_unexported() {
++	local count=$(undefined_all_as_extern_asm | sort | uniq | wc -l)
++	if (( ${count} > 0 )) ; then
++	    mkdir -p checks-export
++	    echo '#include <linux/module.h>' > checks-export/export-check.c
++	    echo 'asm(' >> checks-export/export-check.c
++	    undefined_all_as_extern_asm | sort | uniq >> checks-export/export-check.c || true
++	    echo ');' >> checks-export/export-check.c
++	    echo 'MODULE_LICENSE("GPL");' >> checks-export/export-check.c
++
++	    rm -f checks-export/Makefile checks-export/*.mod.c || true
++	    echo "obj-m += export-check.o" > checks-export/Makefile
++	    local cores=$(grep -c ^processor /proc/cpuinfo)
++	    rm -f export-errors.log
++	    make -j${cores} "$@" M=$(pwd)/checks-export 2>> export-errors.log || true
++	else
++	    echo > export-errors.log
++	fi
++    }
++
++    if [[ "${layer}" != "" ]] ; then
++	get_unexported "$@"
++    fi
++
++    for i in checks/*.c ; do
++	set +e
++	echo ${i} | grep -qE '^.*[.]mod[.]c$'
++	if [[ $? == "0" ]] ; then
++	    continue
++	fi
++	set -e
++
++	if [[ "${layer}" != "" ]] ; then
++	    if [[ "$(get-test-layer ${i})" != "$layer" ]] ; then
++		continue
++	    fi
++	fi
++
++	local j=${i#"checks/"}
++	ID=$(echo ${j%.c} | awk '{ print toupper($0) }')
++
++	if [[ -e checks/${j%.c}.o ]] ; then
++	    if grep -q 'CHECK UNDEFINED: ' checks/${j} ; then
++		# See that all symbols undefined are indeed undefined
++
++		local failed=0
++		for symbol in $(grep 'CHECK UNDEFINED: ' checks/${j} | sed -E 's,.*CHECK UNDEFINED: ([^ ]*) .*,\1,g') ; do
++		    if undefined_one checks/${j%.c}.o | grep -q -E '^'${symbol}'$' ; then
++			:
++		    else
++			failed=1
++		    fi
++		done
++
++		if [[ "${failed}" == "1" ]] ; then
++		    echo "/* #undef COMPAT_DETECT_${ID} (not undefined) */"
++		else
++		    echo "#define COMPAT_DETECT_${ID}"
++		fi
++
++		continue
++	    fi
++
++	    if grep \"${j%.c}\" export-errors.log >/dev/null; then
++		echo "/* #undef COMPAT_DETECT_${ID} (not exported) */"
++	    else
++		echo "#define COMPAT_DETECT_${ID}"
++	    fi
++	else
++	    echo "/* #undef COMPAT_DETECT_${ID} */"
++	fi
++    done
++}
++
++cd $(dirname ${BASH_SOURCE})
++
++rm -f ../compat.h ../compat-after.h
++echo > ../compat.h
++echo > ../compat-after.h
++
++rm -f checks/*.o checks/*.ko errors.log
++
++layer=1
++while true; do
++    if [[ "$(list-srcs ${layer})" == "" ]] ; then
++	break
++    fi
++
++    echo Layer: ${layer}
++    run-build ${layer} "$@"
++    generate-config ${layer} "$@"
++    generate-config > ../compat.h
++    layer=$(( ${layer} + 1 ))
++done
++
++echo -n $(cat ../compat.h | grep -E '^#define (.*)$' | sed -E 's/^#define (.*)/\1=y/g') \
++    > ../compat.env
++
++# Extra config injection based on compat check results
++
++if ! grep -q FSCACHE_INDEX_COOKIE=y ../compat.env ; then
++    echo " CONFIG_NFS_FSCACHE=" >> ../compat.env
++    echo "#undef CONFIG_NFS_FSCACHE" >> ../compat-after.h
++fi
+diff --git a/compat/lint.sh b/compat/lint.sh
+new file mode 100755
+index 000000000..83066c195
+--- /dev/null
++++ b/compat/lint.sh
+@@ -0,0 +1,26 @@
++#!/bin/bash
++
++usage() {
++    git grep COMPAT_DETECT | sed -E 's/.*(COMPAT_DETECT_[0-9A-Z_]+).*/\1/g' | grep -v compat/collect | sort | uniq
++}
++
++invalid() {
++    git grep DETECT_COMPAT
++}
++
++errors=0
++for instance in $(usage) ; do
++    if [[ ! -e compat/checks/$(echo ${instance} | tr 'A-Z' 'a-z' | cut -c15-).c ]] ; then
++	echo "Compat check for ${instance} not found"
++	errors=$((${errors} + 1))
++	git grep ${instance}
++    fi
++done
++
++if git grep DETECT_COMPAT | grep -v compat/lint.sh; then
++    errors=$((${errors} + 1))
++fi
++
++if [[ ${errors} != 0 ]] ; then
++    exit -1
++fi
+diff --git a/inbox-compare/test.c b/inbox-compare/test.c
+index 44920c4f6..62756c4c9 100644
+--- a/inbox-compare/test.c
++++ b/inbox-compare/test.c
+@@ -14,3 +14,4 @@ static void __exit exit_test(void)
+ 
+ module_init(init_test);
+ module_exit(exit_test);
++MODULE_LICENSE("GPL");
+diff --git a/makefile b/makefile
+index 0d4a0c432..ec3f694d5 100755
+--- a/makefile
++++ b/makefile
+@@ -145,8 +145,12 @@ override WITH_MAKE_PARAMS += KBUILD_EXTRA_SYMBOLS=$(OFA)/Module.symvers
+ ifneq ($(OFA_DIR),))
+ default:
+ # compile with ofed driver
++	./compat/collect-config -C $(K_BUILD) CC='$(CC)' O=$(K_OBJ) \
++		LINUXINCLUDE='$(EXTRA_CFLAGS) -include $(autoconf_h) $(KCONFIG_H) -include $(OFA)/include/linux/compat-2.6.h -I$(OFA)/include -I$(OFA)/include/uapi $(BACKPORT_INCLUDES) $$(if $$(CONFIG_XEN),-D__XEN_INTERFACE_VERSION__=$$(CONFIG_XEN_INTERFACE_VERSION)) $$(if $$(CONFIG_XEN),-I$$(srctree)/arch/x86/include/mach-xen) -I$$(srctree)/arch/$$(SRCARCH)/include -Iarch/$$(SRCARCH)/include/generated -Iinclude -I$$(srctree)/arch/$$(SRCARCH)/include/uapi -Iarch/$$(SRCARCH)/include/generated/uapi -I$$(srctree)/include -I$$(srctree)/include/uapi -Iinclude/generated/uapi $$(if $$(KBUILD_SRC),-Iinclude2 -I$$(srctree)/include) -I$$(srctree)/arch/$$(SRCARCH)/include -Iarch/$$(SRCARCH)/include/generated' $(WITH_MAKE_PARAMS)
+ 	make -j8 EXTRA_CFLAGS=-g -C $(K_BUILD) CC='$(CC)' O=$(K_OBJ) M=$(shell pwd)/inbox-compare
++	rm -f Module.symvers
+ 	make -j8 -C $(K_BUILD) CC='$(CC)' O=$(K_OBJ) M=$(shell pwd) $(WITH_MAKE_PARAMS) \
++		$$(cat compat.env) \
+ 		CONFIG_SUNRPC_XPRT_RDMA=m \
+ 		CONFIG_SUNRPC_XPRT_RDMA_CLIENT=m \
+ 		CONFIG_SUNRPC_XPRT_RDMA_SERVER=m \
+@@ -157,9 +161,11 @@ default:
+ 		CONFIG_CTF= \
+ 		LINUXINCLUDE=' \
+ 		$(EXTRA_CFLAGS) \
++		-include compat.h \
+ 		-include $(autoconf_h) \
+ 		$(KCONFIG_H) \
+ 		-include $(OFA)/include/linux/compat-2.6.h \
++		-include compat-after.h \
+ 		-I$(PWD) \
+ 		-I$(PWD)/bundle/include \
+ 		-I$(OFA)/include \
+@@ -184,17 +190,22 @@ default:
+ 	echo -ne "$(BUILD_INFO)" > build-info.txt
+ else
+ default:
+-# compile with ofed driver
++# compile without ofed driver
++	./compat/collect-config -C $(K_BUILD) CC='$(CC)' O=$(K_OBJ)
++	rm -f Module.symvers
+ 	make -j8 -C $(K_BUILD) CC='$(CC)' O=$(K_OBJ) M=$(shell pwd) \
++		$$(cat compat.env) \
+ 		CONFIG_SUNRPC_XPRT_RDMA=m \
+ 		CONFIG_SUNRPC_XPRT_RDMA_CLIENT=m \
+ 		CONFIG_SUNRPC_XPRT_RDMA_SERVER=m \
+ 		CONFIG_SUNRPC_XPRT_RDMA_DUMMY= \
+ 		$(CONFIG_NVSTUB) \
+ 		LINUXINCLUDE=' \
++		-include compat.h \
+ 		$(EXTRA_CFLAGS) \
+ 		-include $(autoconf_h) \
+ 		$(KCONFIG_H) \
++		-include compat-after.h \
+ 		-I$(PWD) \
+ 		-I$(PWD)/bundle/include \
+ 		$$(if $$(CONFIG_XEN),-D__XEN_INTERFACE_VERSION__=$$(CONFIG_XEN_INTERFACE_VERSION)) \
+@@ -247,6 +258,7 @@ dist:
+ 	cp {$(rpmspec),makefile,Makefile,dkms.conf,Module.supported} $(rpmroot)/$(PACKAGE)/
+ 	cp -r inbox-compare compare-debuginfo.sh $(rpmroot)/$(PACKAGE)/
+ 	cp *.h $(rpmroot)/$(PACKAGE)/
++	cp -r compat $(rpmroot)/$(PACKAGE)/
+ 	cp -r bundle $(rpmroot)/$(PACKAGE)/
+ 	cp -r debian $(rpmroot)/$(PACKAGE)/
+ 	cp -r tools $(rpmroot)/$(PACKAGE)/

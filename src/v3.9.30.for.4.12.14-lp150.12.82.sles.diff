@@ -1,0 +1,4057 @@
+diff --git a/bundle/.gitignore b/bundle/.gitignore
+index 1cc4b2e80..0c39aa20b 100644
+--- a/bundle/.gitignore
++++ b/bundle/.gitignore
+@@ -7,38 +7,38 @@
+ # command after changing this file, to see if there are
+ # any tracked files which get ignored after the change.
+ #
+-# Normal rules (sorted alphabetically)
++# Normal rules
+ #
+ .*
+-*.a
+-*.bin
+-*.bz2
+-*.c.[012]*.*
+-*.dwo
+-*.elf
+-*.gcno
+-*.gz
+-*.i
+-*.ko
+-*.ll
+-*.lst
+-*.lz4
+-*.lzma
+-*.lzo
+-*.mod.c
+ *.o
+ *.o.*
+-*.order
+-*.patch
++*.a
+ *.s
++*.ko
+ *.so
+ *.so.dbg
+-*.su
++*.mod.c
++*.i
++*.lst
+ *.symtypes
++*.order
++*.elf
++*.bin
+ *.tar
++*.gz
++*.bz2
++*.lzma
+ *.xz
+-Module.symvers
++*.lz4
++*.lzo
++*.patch
++*.gcno
++*.ll
+ modules.builtin
++Module.symvers
++*.dwo
++*.su
++*.c.[012]*.*
+ 
+ #
+ # Top-level generic files
+@@ -53,11 +53,6 @@ modules.builtin
+ /System.map
+ /Module.markers
+ 
+-#
+-# RPM spec file (make rpm-pkg)
+-#
+-/*.spec
+-
+ #
+ # Debian directory (make deb-pkg)
+ #
+diff --git a/bundle/fs/internal.h b/bundle/fs/internal.h
+index ec6fbaaeb..fedfe94d8 100644
+--- a/bundle/fs/internal.h
++++ b/bundle/fs/internal.h
+@@ -110,6 +110,7 @@ extern struct file *do_file_open_root(struct dentry *, struct vfsmount *,
+ 
+ extern int open_check_o_direct(struct file *f);
+ extern int vfs_open(const struct path *, struct file *, const struct cred *);
++extern struct file *filp_clone_open(struct file *);
+ 
+ /*
+  * inode.c
+diff --git a/bundle/fs/lockd/host.c b/bundle/fs/lockd/host.c
+index b291e632a..a9dab43dd 100644
+--- a/bundle/fs/lockd/host.c
++++ b/bundle/fs/lockd/host.c
+@@ -429,7 +429,12 @@ nlm_bind_host(struct nlm_host *host)
+ 	 * RPC rebind is required
+ 	 */
+ 	if ((clnt = host->h_rpcclnt) != NULL) {
+-		nlm_rebind_host(host);
++		if (time_after_eq(jiffies, host->h_nextrebind)) {
++			rpc_force_rebind(clnt);
++			host->h_nextrebind = jiffies + NLM_HOST_REBIND;
++			dprintk("lockd: next rebind in %lu jiffies\n",
++					host->h_nextrebind - jiffies);
++		}
+ 	} else {
+ 		unsigned long increment = nlmsvc_timeout;
+ 		struct rpc_timeout timeparms = {
+@@ -478,20 +483,13 @@ nlm_bind_host(struct nlm_host *host)
+ 	return clnt;
+ }
+ 
+-/**
+- * nlm_rebind_host - If needed, force a portmap lookup of the peer's lockd port
+- * @host: NLM host handle for peer
+- *
+- * This is not needed when using a connection-oriented protocol, such as TCP.
+- * The existing autobind mechanism is sufficient to force a rebind when
+- * required, e.g. on connection state transitions.
++/*
++ * Force a portmap lookup of the remote lockd port
+  */
+ void
+ nlm_rebind_host(struct nlm_host *host)
+ {
+-	if (host->h_proto != IPPROTO_UDP)
+-		return;
+-
++	dprintk("lockd: rebind host %s\n", host->h_name);
+ 	if (host->h_rpcclnt && time_after_eq(jiffies, host->h_nextrebind)) {
+ 		rpc_force_rebind(host->h_rpcclnt);
+ 		host->h_nextrebind = jiffies + NLM_HOST_REBIND;
+diff --git a/bundle/fs/nfs/callback_proc.c b/bundle/fs/nfs/callback_proc.c
+index 12a55b856..670e884f6 100644
+--- a/bundle/fs/nfs/callback_proc.c
++++ b/bundle/fs/nfs/callback_proc.c
+@@ -124,8 +124,6 @@ static struct inode *nfs_layout_find_inode_by_stateid(struct nfs_client *clp,
+ restart:
+ 	list_for_each_entry_rcu(server, &clp->cl_superblocks, client_link) {
+ 		list_for_each_entry(lo, &server->layouts, plh_layouts) {
+-			if (!pnfs_layout_is_valid(lo))
+-				continue;
+ 			if (stateid != NULL &&
+ 			    !nfs4_stateid_match_other(stateid, &lo->plh_stateid))
+ 				continue;
+diff --git a/bundle/fs/nfs/client.c b/bundle/fs/nfs/client.c
+index 6ee1e2d00..d1856ac4d 100644
+--- a/bundle/fs/nfs/client.c
++++ b/bundle/fs/nfs/client.c
+@@ -212,7 +212,6 @@ struct nfs_client *nfs_alloc_client(const struct nfs_client_initdata *cl_init)
+ 	clp->cl_proto = cl_init->proto;
+ 	clp->cl_nconnect = cl_init->nconnect;
+ 	clp->cl_net = get_net(cl_init->net);
+-	clp->cl_xprt_id = cl_init->xprt_id;
+ 
+ 	clp->cl_principal = "*";
+ 	nfs_fscache_get_client_cookie(clp);
+@@ -327,16 +326,9 @@ static struct nfs_client *nfs_match_client(const struct nfs_client_initdata *dat
+ 	struct nfs_net *nn = net_generic(data->net, nfs_net_id);
+ 	int error;
+ 
+-	if (test_bit(NFS_CS_NO_SHARE, &data->init_flags))
+-		return NULL;
+-
+ again:
+ 	list_for_each_entry(clp, &nn->nfs_client_list, cl_share_link) {
+ 	        const struct sockaddr *clap = (struct sockaddr *)&clp->cl_addr;
+-		if (test_bit(NFS_CS_NO_SHARE,&clp->cl_flags))
+-			continue;
+-		if (clp->cl_xprt_id != data->xprt_id)
+-			continue;
+ 		/* Don't match clients that failed to initialise properly */
+ 		if (clp->cl_cons_state < 0)
+ 			continue;
+@@ -740,8 +732,6 @@ static int nfs_init_server(struct nfs_server *server,
+ 	if (data->flags & NFS_MOUNT_NORESVPORT)
+ 		set_bit(NFS_CS_NORESVPORT, &cl_init.init_flags);
+ 
+-	if (data->flags & NFS_MOUNT_NOSHARE_XPRT)
+-		set_bit(NFS_CS_NO_SHARE, &cl_init.init_flags);
+ 	/* Allocate or find a client reference we can use */
+ 	clp = nfs_get_client(&cl_init);
+ 	if (IS_ERR(clp))
+diff --git a/bundle/fs/nfs/delegation.c b/bundle/fs/nfs/delegation.c
+index 35be826a6..31e234da9 100644
+--- a/bundle/fs/nfs/delegation.c
++++ b/bundle/fs/nfs/delegation.c
+@@ -62,16 +62,6 @@ nfs4_is_valid_delegation(const struct nfs_delegation *delegation,
+ 	return false;
+ }
+ 
+-struct nfs_delegation *nfs4_get_valid_delegation(const struct inode *inode)
+-{
+-	struct nfs_delegation *delegation;
+-
+-	delegation = rcu_dereference(NFS_I(inode)->delegation);
+-	if (nfs4_is_valid_delegation(delegation, 0))
+-		return delegation;
+-	return NULL;
+-}
+-
+ static int
+ nfs4_do_check_delegation(struct inode *inode, fmode_t flags, bool mark)
+ {
+@@ -1010,18 +1000,6 @@ void nfs_mark_test_expired_all_delegations(struct nfs_client *clp)
+ 	rcu_read_unlock();
+ }
+ 
+-/**
+- * nfs_test_expired_all_delegations - test all delegations for a client
+- * @clp: nfs_client to process
+- *
+- * Helper for handling "recallable state revoked" status from server.
+- */
+-void nfs_test_expired_all_delegations(struct nfs_client *clp)
+-{
+-	nfs_mark_test_expired_all_delegations(clp);
+-	nfs4_schedule_state_manager(clp);
+-}
+-
+ static void
+ nfs_delegation_test_free_expired(struct inode *inode,
+ 		nfs4_stateid *stateid,
+@@ -1136,33 +1114,6 @@ int nfs_delegations_present(struct nfs_client *clp)
+ 	return ret;
+ }
+ 
+-/**
+- * nfs4_refresh_delegation_stateid - Update delegation stateid seqid
+- * @dst: stateid to refresh
+- * @inode: inode to check
+- *
+- * Returns "true" and updates "dst->seqid" * if inode had a delegation
+- * that matches our delegation stateid. Otherwise "false" is returned.
+- */
+-bool nfs4_refresh_delegation_stateid(nfs4_stateid *dst, struct inode *inode)
+-{
+-	struct nfs_delegation *delegation;
+-	bool ret = false;
+-	if (!inode)
+-		goto out;
+-
+-	rcu_read_lock();
+-	delegation = rcu_dereference(NFS_I(inode)->delegation);
+-	if (delegation != NULL &&
+-	    nfs4_stateid_match_other(dst, &delegation->stateid)) {
+-		dst->seqid = delegation->stateid.seqid;
+-		ret = true;
+-	}
+-	rcu_read_unlock();
+-out:
+-	return ret;
+-}
+-
+ /**
+  * nfs4_copy_delegation_stateid - Copy inode's state ID information
+  * @inode: inode to check
+diff --git a/bundle/fs/nfs/delegation.h b/bundle/fs/nfs/delegation.h
+index 670e30df6..03bd43aee 100644
+--- a/bundle/fs/nfs/delegation.h
++++ b/bundle/fs/nfs/delegation.h
+@@ -55,7 +55,6 @@ void nfs_delegation_mark_reclaim(struct nfs_client *clp);
+ void nfs_delegation_reap_unclaimed(struct nfs_client *clp);
+ 
+ void nfs_mark_test_expired_all_delegations(struct nfs_client *clp);
+-void nfs_test_expired_all_delegations(struct nfs_client *clp);
+ void nfs_reap_expired_delegations(struct nfs_client *clp);
+ 
+ /* NFSv4 delegation-related procedures */
+@@ -63,9 +62,7 @@ int nfs4_proc_delegreturn(struct inode *inode, const struct cred *cred, const nf
+ int nfs4_open_delegation_recall(struct nfs_open_context *ctx, struct nfs4_state *state, const nfs4_stateid *stateid);
+ int nfs4_lock_delegation_recall(struct file_lock *fl, struct nfs4_state *state, const nfs4_stateid *stateid);
+ bool nfs4_copy_delegation_stateid(struct inode *inode, fmode_t flags, nfs4_stateid *dst, const struct cred **cred);
+-bool nfs4_refresh_delegation_stateid(nfs4_stateid *dst, struct inode *inode);
+ 
+-struct nfs_delegation *nfs4_get_valid_delegation(const struct inode *inode);
+ void nfs_mark_delegation_referenced(struct nfs_delegation *delegation);
+ int nfs4_have_delegation(struct inode *inode, fmode_t flags);
+ int nfs4_check_delegation(struct inode *inode, fmode_t flags);
+diff --git a/bundle/fs/nfs/dir.c b/bundle/fs/nfs/dir.c
+index af45bbcd5..c1477f14d 100644
+--- a/bundle/fs/nfs/dir.c
++++ b/bundle/fs/nfs/dir.c
+@@ -165,17 +165,6 @@ typedef struct {
+ 	unsigned int	eof:1;
+ } nfs_readdir_descriptor_t;
+ 
+-static
+-void nfs_readdir_init_array(struct page *page)
+-{
+-	struct nfs_cache_array *array;
+-
+-	array = kmap_atomic(page);
+-	memset(array, 0, sizeof(struct nfs_cache_array));
+-	array->eof_index = -1;
+-	kunmap_atomic(array);
+-}
+-
+ /*
+  * we are freeing strings created by nfs_add_to_readdir_array()
+  */
+@@ -188,7 +177,6 @@ void nfs_readdir_clear_array(struct page *page)
+ 	array = kmap_atomic(page);
+ 	for (i = 0; i < array->size; i++)
+ 		kfree(array->array[i].string.name);
+-	array->size = 0;
+ 	kunmap_atomic(array);
+ }
+ 
+@@ -605,9 +593,6 @@ int nfs_readdir_page_filler(nfs_readdir_descriptor_t *desc, struct nfs_entry *en
+ 	xdr_set_scratch_buffer(&stream, page_address(scratch), PAGE_SIZE);
+ 
+ 	do {
+-		if (entry->label)
+-			entry->label->len = NFS4_MAXLABELLEN;
+-
+ 		status = xdr_decode(desc, entry, &stream);
+ 		if (status != 0) {
+ 			if (status == -EAGAIN)
+@@ -678,8 +663,6 @@ int nfs_readdir_xdr_to_array(nfs_readdir_descriptor_t *desc, struct page *page,
+ 	int status = -ENOMEM;
+ 	unsigned int array_size = ARRAY_SIZE(pages);
+ 
+-	nfs_readdir_init_array(page);
+-
+ 	entry.prev_cookie = 0;
+ 	entry.cookie = desc->last_cookie;
+ 	entry.eof = 0;
+@@ -696,6 +679,8 @@ int nfs_readdir_xdr_to_array(nfs_readdir_descriptor_t *desc, struct page *page,
+ 	}
+ 
+ 	array = kmap(page);
++	memset(array, 0, sizeof(struct nfs_cache_array));
++	array->eof_index = -1;
+ 
+ 	status = nfs_readdir_alloc_pages(pages, array_size);
+ 	if (status < 0)
+@@ -749,7 +734,6 @@ int nfs_readdir_filler(nfs_readdir_descriptor_t *desc, struct page* page)
+ 	unlock_page(page);
+ 	return 0;
+  error:
+-	nfs_readdir_clear_array(page);
+ 	unlock_page(page);
+ 	return ret;
+ }
+@@ -757,6 +741,8 @@ int nfs_readdir_filler(nfs_readdir_descriptor_t *desc, struct page* page)
+ static
+ void cache_page_release(nfs_readdir_descriptor_t *desc)
+ {
++	if (!desc->page->mapping)
++		nfs_readdir_clear_array(desc->page);
+ 	put_page(desc->page);
+ 	desc->page = NULL;
+ }
+@@ -770,10 +756,9 @@ struct page *get_cache_page(nfs_readdir_descriptor_t *desc)
+ 
+ /*
+  * Returns 0 if desc->dir_cookie was found on page desc->page_index
+- * and locks the page to prevent removal from the page cache.
+  */
+ static
+-int find_and_lock_cache_page(nfs_readdir_descriptor_t *desc)
++int find_cache_page(nfs_readdir_descriptor_t *desc)
+ {
+ 	struct inode *inode = file_inode(desc->file);
+ 	struct nfs_inode *nfsi = NFS_I(inode);
+@@ -782,20 +767,13 @@ int find_and_lock_cache_page(nfs_readdir_descriptor_t *desc)
+ 	desc->page = get_cache_page(desc);
+ 	if (IS_ERR(desc->page))
+ 		return PTR_ERR(desc->page);
+-	res = lock_page_killable(desc->page);
++
++	res = nfs_readdir_search_array(desc);
+ 	if (res != 0)
+-		goto error;
+-	res = -EAGAIN;
+-	if (desc->page->mapping != NULL) {
+-		res = nfs_readdir_search_array(desc);
+-		if (res == 0) {
+-			nfsi->page_index = desc->page_index;
+-			return 0;
+-		}
+-	}
+-	unlock_page(desc->page);
+-error:
+-	cache_page_release(desc);
++		cache_page_release(desc);
++	else
++		nfsi->page_index = desc->page_index;
++
+ 	return res;
+ }
+ 
+@@ -811,7 +789,7 @@ int readdir_search_pagecache(nfs_readdir_descriptor_t *desc)
+ 		desc->last_cookie = 0;
+ 	}
+ 	do {
+-		res = find_and_lock_cache_page(desc);
++		res = find_cache_page(desc);
+ 	} while (res == -EAGAIN);
+ 	return res;
+ }
+@@ -853,6 +831,7 @@ int nfs_do_filldir(nfs_readdir_descriptor_t *desc)
+ 		desc->eof = 1;
+ 
+ 	kunmap(desc->page);
++	cache_page_release(desc);
+ 	dfprintk(DIRCACHE, "NFS: nfs_do_filldir() filling ended @ cookie %Lu; returning = %d\n",
+ 			(unsigned long long)*desc->dir_cookie, res);
+ 	return res;
+@@ -898,13 +877,13 @@ int uncached_readdir(nfs_readdir_descriptor_t *desc)
+ 
+ 	status = nfs_do_filldir(desc);
+ 
+- out_release:
+-	nfs_readdir_clear_array(desc->page);
+-	cache_page_release(desc);
+  out:
+ 	dfprintk(DIRCACHE, "NFS: %s: returns %d\n",
+ 			__func__, status);
+ 	return status;
++ out_release:
++	cache_page_release(desc);
++	goto out;
+ }
+ 
+ /* The file offset position represents the dirent entry number.  A
+@@ -966,8 +945,6 @@ static int nfs_readdir(struct file *file, struct dir_context *ctx)
+ 			break;
+ 
+ 		res = nfs_do_filldir(desc);
+-		unlock_page(desc->page);
+-		cache_page_release(desc);
+ 		if (res < 0)
+ 			break;
+ 	} while (!desc->eof);
+@@ -1249,7 +1226,7 @@ nfs_do_lookup_revalidate(struct inode *dir, struct dentry *dentry,
+ 			 unsigned int flags)
+ {
+ 	struct inode *inode;
+-	int error = 0;
++	int error;
+ 
+ 	nfs_inc_stats(dir, NFSIOS_DENTRYREVALIDATE);
+ 	inode = d_inode(dentry);
+@@ -1271,10 +1248,8 @@ nfs_do_lookup_revalidate(struct inode *dir, struct dentry *dentry,
+ 	    nfs_check_verifier(dir, dentry, flags & LOOKUP_RCU)) {
+ 		error = nfs_lookup_verify_inode(inode, flags);
+ 		if (error) {
+-			if (error == -ESTALE) {
++			if (error == -ESTALE)
+ 				nfs_zap_caches(dir);
+-				error = 0;
+-			}
+ 			goto out_bad;
+ 		}
+ 		nfs_advise_use_readdirplus(dir);
+@@ -1296,7 +1271,7 @@ out_valid:
+ out_bad:
+ 	if (flags & LOOKUP_RCU)
+ 		return -ECHILD;
+-	return nfs_lookup_revalidate_done(dir, dentry, inode, error);
++	return nfs_lookup_revalidate_done(dir, dentry, inode, 0);
+ }
+ 
+ static int
+diff --git a/bundle/fs/nfs/direct.c b/bundle/fs/nfs/direct.c
+index f1c33d3ee..03fed7e18 100644
+--- a/bundle/fs/nfs/direct.c
++++ b/bundle/fs/nfs/direct.c
+@@ -119,49 +119,32 @@ static inline int put_dreq(struct nfs_direct_req *dreq)
+ }
+ 
+ static void
+-nfs_direct_handle_truncated(struct nfs_direct_req *dreq,
+-			    const struct nfs_pgio_header *hdr,
+-			    ssize_t dreq_len)
++nfs_direct_good_bytes(struct nfs_direct_req *dreq, struct nfs_pgio_header *hdr)
+ {
+-	struct nfs_direct_mirror *mirror = &dreq->mirrors[hdr->pgio_mirror_idx];
+-
+-	if (!(test_bit(NFS_IOHDR_ERROR, &hdr->flags) ||
+-	      test_bit(NFS_IOHDR_EOF, &hdr->flags)))
+-		return;
+-	if (dreq->max_count >= dreq_len) {
+-		dreq->max_count = dreq_len;
+-		if (dreq->count > dreq_len)
+-			dreq->count = dreq_len;
+-
+-		if (test_bit(NFS_IOHDR_ERROR, &hdr->flags))
+-			dreq->error = hdr->error;
+-		else /* Clear outstanding error if this is EOF */
+-			dreq->error = 0;
+-	}
+-	if (mirror->count > dreq_len)
+-		mirror->count = dreq_len;
+-}
+-
+-static void
+-nfs_direct_count_bytes(struct nfs_direct_req *dreq,
+-		       const struct nfs_pgio_header *hdr)
+-{
+-	struct nfs_direct_mirror *mirror = &dreq->mirrors[hdr->pgio_mirror_idx];
+-	loff_t hdr_end = hdr->io_start + hdr->good_bytes;
+-	ssize_t dreq_len = 0;
++	int i;
++	ssize_t count;
+ 
+-	if (hdr_end > dreq->io_start)
+-		dreq_len = hdr_end - dreq->io_start;
++	WARN_ON_ONCE(dreq->count >= dreq->max_count);
+ 
+-	nfs_direct_handle_truncated(dreq, hdr, dreq_len);
++	if (dreq->mirror_count == 1) {
++		dreq->mirrors[hdr->pgio_mirror_idx].count += hdr->good_bytes;
++		dreq->count += hdr->good_bytes;
++	} else {
++		/* mirrored writes */
++		count = dreq->mirrors[hdr->pgio_mirror_idx].count;
++		if (count + dreq->io_start < hdr->io_start + hdr->good_bytes) {
++			count = hdr->io_start + hdr->good_bytes - dreq->io_start;
++			dreq->mirrors[hdr->pgio_mirror_idx].count = count;
++		}
++		/* update the dreq->count by finding the minimum agreed count from all
++		 * mirrors */
++		count = dreq->mirrors[0].count;
+ 
+-	if (dreq_len > dreq->max_count)
+-		dreq_len = dreq->max_count;
++		for (i = 1; i < dreq->mirror_count; i++)
++			count = min(count, dreq->mirrors[i].count);
+ 
+-	if (mirror->count < dreq_len)
+-		mirror->count = dreq_len;
+-	if (dreq->count < dreq_len)
+-		dreq->count = dreq_len;
++		dreq->count = count;
++	}
+ }
+ 
+ /*
+@@ -258,10 +241,10 @@ static int nfs_direct_cmp_commit_data_verf(struct nfs_direct_req *dreq,
+ 					 data->ds_commit_index);
+ 
+ 	/* verifier not set so always fail */
+-	if (verfp->committed < 0 || data->res.verf->committed <= NFS_UNSTABLE)
++	if (verfp->committed < 0)
+ 		return 1;
+ 
+-	return nfs_direct_cmp_verf(verfp, data->res.verf);
++	return nfs_direct_cmp_verf(verfp, &data->verf);
+ }
+ 
+ /**
+@@ -415,12 +398,20 @@ static void nfs_direct_read_completion(struct nfs_pgio_header *hdr)
+ 	struct nfs_direct_req *dreq = hdr->dreq;
+ 
+ 	spin_lock(&dreq->lock);
++	if (test_bit(NFS_IOHDR_ERROR, &hdr->flags))
++		dreq->error = hdr->error;
++
+ 	if (test_bit(NFS_IOHDR_REDO, &hdr->flags)) {
+ 		spin_unlock(&dreq->lock);
+ 		goto out_put;
+ 	}
+ 
+-	nfs_direct_count_bytes(dreq, hdr);
++	if (hdr->good_bytes != 0)
++		nfs_direct_good_bytes(dreq, hdr);
++
++	if (test_bit(NFS_IOHDR_EOF, &hdr->flags))
++		dreq->error = 0;
++
+ 	spin_unlock(&dreq->lock);
+ 
+ 	while (!list_empty(&hdr->pages)) {
+@@ -653,9 +644,6 @@ static void nfs_direct_write_reschedule(struct nfs_direct_req *dreq)
+ 	nfs_direct_write_scan_commit_list(dreq->inode, &reqs, &cinfo);
+ 
+ 	dreq->count = 0;
+-	dreq->max_count = 0;
+-	list_for_each_entry(req, &reqs, wb_list)
+-		dreq->max_count += req->wb_bytes;
+ 	dreq->verf.committed = NFS_INVALID_STABLE_HOW;
+ 	nfs_clear_pnfs_ds_commit_verifiers(&dreq->ds_cinfo);
+ 	for (i = 0; i < dreq->mirror_count; i++)
+@@ -789,13 +777,17 @@ static void nfs_direct_write_completion(struct nfs_pgio_header *hdr)
+ 	nfs_init_cinfo_from_dreq(&cinfo, dreq);
+ 
+ 	spin_lock(&dreq->lock);
++
++	if (test_bit(NFS_IOHDR_ERROR, &hdr->flags))
++		dreq->error = hdr->error;
++
+ 	if (test_bit(NFS_IOHDR_REDO, &hdr->flags)) {
+ 		spin_unlock(&dreq->lock);
+ 		goto out_put;
+ 	}
+ 
+-	nfs_direct_count_bytes(dreq, hdr);
+ 	if (hdr->good_bytes != 0) {
++		nfs_direct_good_bytes(dreq, hdr);
+ 		if (nfs_write_need_commit(hdr)) {
+ 			if (dreq->flags == NFS_ODIRECT_RESCHED_WRITES)
+ 				request_commit = true;
+diff --git a/bundle/fs/nfs/file.c b/bundle/fs/nfs/file.c
+index d27017c80..29dfb0899 100644
+--- a/bundle/fs/nfs/file.c
++++ b/bundle/fs/nfs/file.c
+@@ -79,11 +79,6 @@ nfs_file_open(struct inode *inode, struct file *filp)
+ int
+ nfs_file_release(struct inode *inode, struct file *filp)
+ {
+-	if (!nfs_file_open_context(filp)) {
+-		dprintk("NFS: buggy mvfs module called fput after failed open\n");
+-		return 0;
+-	}
+-
+ 	dprintk("NFS: release(%pD2)\n", filp);
+ 
+ 	if (filp->f_mode & FMODE_WRITE)
+diff --git a/bundle/fs/nfs/flexfilelayout/flexfilelayout.c b/bundle/fs/nfs/flexfilelayout/flexfilelayout.c
+index 5db94fd7b..a8855b070 100644
+--- a/bundle/fs/nfs/flexfilelayout/flexfilelayout.c
++++ b/bundle/fs/nfs/flexfilelayout/flexfilelayout.c
+@@ -495,9 +495,9 @@ ff_layout_alloc_lseg(struct pnfs_layout_hdr *lh,
+ 		if (gfp_flags & __GFP_FS)
+ 			kcred = prepare_kernel_cred(NULL);
+ 		else {
+-			unsigned int noio_flags = memalloc_noio_save();
++			unsigned int nofs_flags = memalloc_nofs_save();
+ 			kcred = prepare_kernel_cred(NULL);
+-			memalloc_noio_restore(noio_flags);
++			memalloc_nofs_restore(nofs_flags);
+ 		}
+ 		rc = -ENOMEM;
+ 		if (!kcred)
+@@ -929,8 +929,9 @@ retry:
+ 		goto out_mds;
+ 
+ 	/* Use a direct mapping of ds_idx to pgio mirror_idx */
+-	if (pgio->pg_mirror_count != FF_LAYOUT_MIRROR_COUNT(pgio->pg_lseg))
+-		goto out_eagain;
++	if (WARN_ON_ONCE(pgio->pg_mirror_count !=
++	    FF_LAYOUT_MIRROR_COUNT(pgio->pg_lseg)))
++		goto out_mds;
+ 
+ 	for (i = 0; i < pgio->pg_mirror_count; i++) {
+ 		ds = nfs4_ff_layout_prepare_ds(pgio->pg_lseg, i, true);
+@@ -949,15 +950,11 @@ retry:
+ 	}
+ 
+ 	return;
+-out_eagain:
+-	pnfs_generic_pg_cleanup(pgio);
+-	pgio->pg_error = -EAGAIN;
+-	return;
++
+ out_mds:
+ 	pnfs_put_lseg(pgio->pg_lseg);
+ 	pgio->pg_lseg = NULL;
+ 	nfs_pageio_reset_write_mds(pgio);
+-	pgio->pg_error = -EAGAIN;
+ }
+ 
+ static unsigned int
+diff --git a/bundle/fs/nfs/flexfilelayout/flexfilelayoutdev.c b/bundle/fs/nfs/flexfilelayout/flexfilelayoutdev.c
+index d81f0f2f1..920c81bc4 100644
+--- a/bundle/fs/nfs/flexfilelayout/flexfilelayoutdev.c
++++ b/bundle/fs/nfs/flexfilelayout/flexfilelayoutdev.c
+@@ -17,7 +17,7 @@
+ 
+ #define NFSDBG_FACILITY		NFSDBG_PNFS_LD
+ 
+-static unsigned int dataserver_timeo = NFS_DEF_TCP_TIMEO;
++static unsigned int dataserver_timeo = NFS_DEF_TCP_RETRANS;
+ static unsigned int dataserver_retrans;
+ 
+ static inline const struct cred *get_cred_rcu(const struct cred *cred)
+diff --git a/bundle/fs/nfs/inode.c b/bundle/fs/nfs/inode.c
+index 390c273f6..e73cf3c00 100644
+--- a/bundle/fs/nfs/inode.c
++++ b/bundle/fs/nfs/inode.c
+@@ -87,9 +87,9 @@ int nfs_wait_bit_killable(struct wait_bit_key *key, int mode)
+ }
+ EXPORT_SYMBOL_GPL(nfs_wait_bit_killable);
+ 
+-int nfs_wait_atomic_killable(atomic_t *p, unsigned int mode)
++int nfs_wait_atomic_killable(atomic_t *p)
+ {
+-	return nfs_wait_killable(mode);
++	return nfs_wait_killable(TASK_KILLABLE);
+ }
+ 
+ /**
+@@ -2026,7 +2026,7 @@ static int nfsiod_start(void)
+ {
+ 	struct workqueue_struct *wq;
+ 	dprintk("RPC:       creating workqueue nfsiod\n");
+-	wq = alloc_workqueue("nfsiod", WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
++	wq = alloc_workqueue("nfsiod", WQ_MEM_RECLAIM, 0);
+ 	if (wq == NULL)
+ 		return -ENOMEM;
+ 	nfsiod_workqueue = wq;
+diff --git a/bundle/fs/nfs/internal.h b/bundle/fs/nfs/internal.h
+index cd27a45bb..3efcfd504 100644
+--- a/bundle/fs/nfs/internal.h
++++ b/bundle/fs/nfs/internal.h
+@@ -88,7 +88,6 @@ struct nfs_client_initdata {
+ 	unsigned int nconnect;
+ 	struct net *net;
+ 	const struct rpc_timeout *timeparms;
+-	unsigned int xprt_id;
+ };
+ 
+ /*
+@@ -110,7 +109,6 @@ struct nfs_parsed_mount_data {
+ 	unsigned int		minorversion;
+ 	char			*fscache_uniq;
+ 	bool			need_mount;
+-	unsigned int		xprt_id;
+ 	struct rpc_portgroup *local_ports;
+ 	struct rpc_portgroup *remote_ports;
+ 	bool			no_idle_xprt;
+@@ -442,7 +440,7 @@ extern void nfs_evict_inode(struct inode *);
+ void nfs_zap_acl_cache(struct inode *inode);
+ extern bool nfs_check_cache_invalid(struct inode *, unsigned long);
+ extern int nfs_wait_bit_killable(struct wait_bit_key *key, int mode);
+-extern int nfs_wait_atomic_killable(atomic_t *p, unsigned int mode);
++extern int nfs_wait_atomic_killable(atomic_t *p);
+ 
+ /* super.c */
+ extern const struct super_operations nfs_sops;
+@@ -629,14 +627,12 @@ extern void nfs4_test_session_trunk(struct rpc_clnt *clnt,
+ 
+ static inline struct inode *nfs_igrab_and_active(struct inode *inode)
+ {
+-	struct super_block *sb = inode->i_sb;
+-
+-	if (sb && nfs_sb_active(sb)) {
+-		if (igrab(inode))
+-			return inode;
+-		nfs_sb_deactive(sb);
++	inode = igrab(inode);
++	if (inode != NULL && !nfs_sb_active(inode->i_sb)) {
++		iput(inode);
++		inode = NULL;
+ 	}
+-	return NULL;
++	return inode;
+ }
+ 
+ static inline void nfs_iput_and_deactive(struct inode *inode)
+@@ -722,11 +718,8 @@ void nfs_mark_page_unstable(struct page *page, struct nfs_commit_info *cinfo)
+ 	if (!cinfo->dreq) {
+ 		struct inode *inode = page_file_mapping(page)->host;
+ 
+-		/* This page is really still in write-back - just that the
+-		 * writeback is happening on the server now.
+-		 */
+-		inc_node_page_state(page, NR_WRITEBACK);
+-		inc_wb_stat(&inode_to_bdi(inode)->wb, WB_WRITEBACK);
++		inc_node_page_state(page, NR_UNSTABLE_NFS);
++		inc_wb_stat(&inode_to_bdi(inode)->wb, WB_RECLAIMABLE);
+ 		__mark_inode_dirty(inode, I_DIRTY_DATASYNC);
+ 	}
+ }
+diff --git a/bundle/fs/nfs/namespace.c b/bundle/fs/nfs/namespace.c
+index d57d453ae..e5686be67 100644
+--- a/bundle/fs/nfs/namespace.c
++++ b/bundle/fs/nfs/namespace.c
+@@ -30,9 +30,9 @@ int nfs_mountpoint_expiry_timeout = 500 * HZ;
+ /*
+  * nfs_path - reconstruct the path given an arbitrary dentry
+  * @base - used to return pointer to the end of devname part of path
+- * @dentry_in - pointer to dentry
++ * @dentry - pointer to dentry
+  * @buffer - result buffer
+- * @buflen_in - length of buffer
++ * @buflen - length of buffer
+  * @flags - options (see below)
+  *
+  * Helper function for constructing the server pathname
+@@ -47,19 +47,15 @@ int nfs_mountpoint_expiry_timeout = 500 * HZ;
+  *		       the original device (export) name
+  *		       (if unset, the original name is returned verbatim)
+  */
+-char *nfs_path(char **p, struct dentry *dentry_in, char *buffer,
+-	       ssize_t buflen_in, unsigned flags)
++char *nfs_path(char **p, struct dentry *dentry, char *buffer, ssize_t buflen,
++	       unsigned flags)
+ {
+ 	char *end;
+ 	int namelen;
+ 	unsigned seq;
+ 	const char *base;
+-	struct dentry *dentry;
+-	ssize_t buflen;
+ 
+ rename_retry:
+-	buflen = buflen_in;
+-	dentry = dentry_in;
+ 	end = buffer+buflen;
+ 	*--end = '\0';
+ 	buflen--;
+diff --git a/bundle/fs/nfs/nfs3acl.c b/bundle/fs/nfs/nfs3acl.c
+index 6c378435f..720d92f5a 100644
+--- a/bundle/fs/nfs/nfs3acl.c
++++ b/bundle/fs/nfs/nfs3acl.c
+@@ -252,45 +252,37 @@ int nfs3_proc_setacls(struct inode *inode, struct posix_acl *acl,
+ 
+ int nfs3_set_acl(struct inode *inode, struct posix_acl *acl, int type)
+ {
+-	struct posix_acl *orig = acl, *dfacl = NULL, *alloc;
++	struct posix_acl *alloc = NULL, *dfacl = NULL;
+ 	int status;
+ 
+ 	if (S_ISDIR(inode->i_mode)) {
+ 		switch(type) {
+ 		case ACL_TYPE_ACCESS:
+-			alloc = get_acl(inode, ACL_TYPE_DEFAULT);
++			alloc = dfacl = get_acl(inode, ACL_TYPE_DEFAULT);
+ 			if (IS_ERR(alloc))
+ 				goto fail;
+-			dfacl = alloc;
+ 			break;
+ 
+ 		case ACL_TYPE_DEFAULT:
+-			alloc = get_acl(inode, ACL_TYPE_ACCESS);
++			dfacl = acl;
++			alloc = acl = get_acl(inode, ACL_TYPE_ACCESS);
+ 			if (IS_ERR(alloc))
+ 				goto fail;
+-			dfacl = acl;
+-			acl = alloc;
+ 			break;
+ 		}
+ 	}
+ 
+ 	if (acl == NULL) {
+-		alloc = posix_acl_from_mode(inode->i_mode, GFP_KERNEL);
++		alloc = acl = posix_acl_from_mode(inode->i_mode, GFP_KERNEL);
+ 		if (IS_ERR(alloc))
+ 			goto fail;
+-		acl = alloc;
+ 	}
+ 	status = __nfs3_proc_setacls(inode, acl, dfacl);
+-out:
+-	if (acl != orig)
+-		posix_acl_release(acl);
+-	if (dfacl != orig)
+-		posix_acl_release(dfacl);
++	posix_acl_release(alloc);
+ 	return status;
+ 
+ fail:
+-	status = PTR_ERR(alloc);
+-	goto out;
++	return PTR_ERR(alloc);
+ }
+ 
+ const struct xattr_handler *nfs3_xattr_handlers[] = {
+diff --git a/bundle/fs/nfs/nfs3xdr.c b/bundle/fs/nfs/nfs3xdr.c
+index 5d70a2ea3..91a3444f2 100644
+--- a/bundle/fs/nfs/nfs3xdr.c
++++ b/bundle/fs/nfs/nfs3xdr.c
+@@ -2363,7 +2363,6 @@ static int nfs3_xdr_dec_commit3res(struct rpc_rqst *req,
+ 				   void *data)
+ {
+ 	struct nfs_commitres *result = data;
+-	struct nfs_writeverf *verf = result->verf;
+ 	enum nfs_stat status;
+ 	int error;
+ 
+@@ -2376,9 +2375,7 @@ static int nfs3_xdr_dec_commit3res(struct rpc_rqst *req,
+ 	result->op_status = status;
+ 	if (status != NFS3_OK)
+ 		goto out_status;
+-	error = decode_writeverf3(xdr, &verf->verifier);
+-	if (!error)
+-		verf->committed = NFS_FILE_SYNC;
++	error = decode_writeverf3(xdr, &result->verf->verifier);
+ out:
+ 	return error;
+ out_status:
+diff --git a/bundle/fs/nfs/nfs42proc.c b/bundle/fs/nfs/nfs42proc.c
+index 29f8d666f..319a47db2 100644
+--- a/bundle/fs/nfs/nfs42proc.c
++++ b/bundle/fs/nfs/nfs42proc.c
+@@ -185,15 +185,7 @@ static ssize_t _nfs42_proc_copy(struct file *src,
+ 
+ 	truncate_pagecache_range(dst_inode, pos_dst,
+ 				 pos_dst + res->write_res.count);
+-	spin_lock(&dst_inode->i_lock);
+-	NFS_I(dst_inode)->cache_validity |= (NFS_INO_REVAL_PAGECACHE |
+-			NFS_INO_REVAL_FORCED |
+-			NFS_INO_INVALID_ATTR | NFS_INO_INVALID_DATA);
+-	spin_unlock(&dst_inode->i_lock);
+-	spin_lock(&file_inode(src)->i_lock);
+-	NFS_I(file_inode(src))->cache_validity |= (NFS_INO_REVAL_PAGECACHE |
+-			NFS_INO_REVAL_FORCED | NFS_INO_INVALID_ATIME);
+-	spin_unlock(&file_inode(src)->i_lock);
++
+ 	status = res->write_res.count;
+ out:
+ 	kfree(res->commit_res.verf);
+diff --git a/bundle/fs/nfs/nfs4_fs.h b/bundle/fs/nfs/nfs4_fs.h
+index 2d73329f8..3e710be99 100644
+--- a/bundle/fs/nfs/nfs4_fs.h
++++ b/bundle/fs/nfs/nfs4_fs.h
+@@ -401,7 +401,9 @@ extern void nfs4_schedule_state_renewal(struct nfs_client *);
+ extern void nfs4_renewd_prepare_shutdown(struct nfs_server *);
+ extern void nfs4_kill_renewd(struct nfs_client *);
+ extern void nfs4_renew_state(struct work_struct *);
+-extern void nfs4_set_lease_period(struct nfs_client *clp, unsigned long lease);
++extern void nfs4_set_lease_period(struct nfs_client *clp,
++		unsigned long lease,
++		unsigned long lastrenewed);
+ 
+ 
+ /* nfs4state.c */
+@@ -451,8 +453,6 @@ extern int nfs4_set_lock_state(struct nfs4_state *state, struct file_lock *fl);
+ extern int nfs4_select_rw_stateid(struct nfs4_state *, fmode_t,
+ 		const struct nfs_lock_context *, nfs4_stateid *,
+ 		const struct cred **);
+-extern bool nfs4_refresh_open_stateid(nfs4_stateid *dst,
+-		struct nfs4_state *state);
+ 
+ extern struct nfs_seqid *nfs_alloc_seqid(struct nfs_seqid_counter *counter, gfp_t gfp_mask);
+ extern int nfs_wait_on_sequence(struct nfs_seqid *seqid, struct rpc_task *task);
+@@ -460,7 +460,7 @@ extern void nfs_increment_open_seqid(int status, struct nfs_seqid *seqid);
+ extern void nfs_increment_lock_seqid(int status, struct nfs_seqid *seqid);
+ extern void nfs_release_seqid(struct nfs_seqid *seqid);
+ extern void nfs_free_seqid(struct nfs_seqid *seqid);
+-extern int nfs4_setup_sequence(struct nfs_client *client,
++extern int nfs4_setup_sequence(const struct nfs_client *client,
+ 				struct nfs4_sequence_args *args,
+ 				struct nfs4_sequence_res *res,
+ 				struct rpc_task *task);
+diff --git a/bundle/fs/nfs/nfs4client.c b/bundle/fs/nfs/nfs4client.c
+index e662f4241..7234f26b9 100644
+--- a/bundle/fs/nfs/nfs4client.c
++++ b/bundle/fs/nfs/nfs4client.c
+@@ -569,9 +569,6 @@ int nfs40_walk_client_list(struct nfs_client *new,
+ 		 * way that a SETCLIENTID_CONFIRM to pos can succeed is
+ 		 * if new and pos point to the same server:
+ 		 */
+-
+-		if (pos->cl_xprt_id != new->cl_xprt_id)
+-			continue;
+ found:
+ 		atomic_inc(&pos->cl_count);
+ 		spin_unlock(&nn->nfs_client_lock);
+@@ -714,9 +711,6 @@ int nfs41_walk_client_list(struct nfs_client *new,
+ 		if (pos == new)
+ 			goto found;
+ 
+-		if (pos->cl_xprt_id != new->cl_xprt_id)
+-			continue;
+-
+ 		status = nfs4_match_client(pos, new, &prev, nn);
+ 		if (status < 0)
+ 			goto out;
+@@ -853,7 +847,7 @@ static int nfs4_set_client(struct nfs_server *server,
+ 		const char *ip_addr,
+ 		int proto, const struct rpc_timeout *timeparms,
+ 		u32 minorversion, unsigned int nconnect,
+-		struct net *net, unsigned int xprt_id)
++		struct net *net)
+ {
+ 	struct nfs_client_initdata cl_init = {
+ 		.hostname = hostname,
+@@ -865,7 +859,6 @@ static int nfs4_set_client(struct nfs_server *server,
+ 		.minorversion = minorversion,
+ 		.net = net,
+ 		.timeparms = timeparms,
+-		.xprt_id = xprt_id,
+ 	};
+ 	struct nfs_client *clp;
+ 
+@@ -926,7 +919,6 @@ struct nfs_client *nfs4_set_ds_client(struct nfs_server *mds_srv,
+ 		.minorversion = minor_version,
+ 		.net = mds_clp->cl_net,
+ 		.timeparms = &ds_timeout,
+-		.xprt_id = mds_clp->cl_xprt_id,
+ 	};
+ 	char buf[INET6_ADDRSTRLEN + 1];
+ 
+@@ -1071,8 +1063,7 @@ static int nfs4_init_server(struct nfs_server *server,
+ 			&timeparms,
+ 			data->minorversion,
+ 			data->nfs_server.nconnect,
+-			data->net,
+-			data->xprt_id);
++			data->net);
+ 	if (error < 0)
+ 		return error;
+ 
+@@ -1148,7 +1139,7 @@ struct nfs_server *nfs4_create_referral_server(struct nfs_clone_mount *data,
+ 	nfs_server_copy_userdata(server, parent_server);
+ 
+ 	/* Get a client representation */
+-#if defined(CONFIG_SUNRPC_XPRT_RDMA) || defined(CONFIG_SUNRPC_XPRT_RDMA_MODULE)
++#ifdef CONFIG_SUNRPC_XPRT_RDMA
+ 	rpc_set_port(data->addr, NFS_RDMA_PORT);
+ 	error = nfs4_set_client(server, data->hostname,
+ 				data->addr,
+@@ -1158,9 +1149,7 @@ struct nfs_server *nfs4_create_referral_server(struct nfs_clone_mount *data,
+ 				parent_server->client->cl_timeout,
+ 				parent_client->cl_mvops->minor_version,
+ 				parent_client->cl_nconnect,
+-				parent_client->cl_net,
+-				parent_client->cl_xprt_id);
+-
++				parent_client->cl_net);
+ 	if (!error)
+ 		goto init_server;
+ #endif	/* CONFIG_SUNRPC_XPRT_RDMA */
+@@ -1174,12 +1163,11 @@ struct nfs_server *nfs4_create_referral_server(struct nfs_clone_mount *data,
+ 				parent_server->client->cl_timeout,
+ 				parent_client->cl_mvops->minor_version,
+ 				parent_client->cl_nconnect,
+-				parent_client->cl_net,
+-				parent_client->cl_xprt_id);
++				parent_client->cl_net);
+ 	if (error < 0)
+ 		goto error;
+ 
+-#if defined(CONFIG_SUNRPC_XPRT_RDMA) || defined(CONFIG_SUNRPC_XPRT_RDMA_MODULE)	
++#ifdef CONFIG_SUNRPC_XPRT_RDMA
+ init_server:
+ #endif
+ 	error = nfs_init_server_rpcclient(server, parent_server->client->cl_timeout, data->authflavor);
+@@ -1270,7 +1258,7 @@ int nfs4_update_server(struct nfs_server *server, const char *hostname,
+ 	error = nfs4_set_client(server, hostname, sap, salen, buf,
+ 				clp->cl_proto, clnt->cl_timeout,
+ 				clp->cl_minorversion,
+-				clp->cl_nconnect, net, clp->cl_xprt_id);
++				clp->cl_nconnect, net);
+ 	if (error != 0) {
+ 		nfs_server_insert_lists(server);
+ 		return error;
+diff --git a/bundle/fs/nfs/nfs4proc.c b/bundle/fs/nfs/nfs4proc.c
+index 9191651d5..9ef3e762b 100644
+--- a/bundle/fs/nfs/nfs4proc.c
++++ b/bundle/fs/nfs/nfs4proc.c
+@@ -933,11 +933,12 @@ void nfs4_sequence_attach_slot(struct nfs4_sequence_args *args,
+ 	res->sr_slot = slot;
+ }
+ 
+-int nfs4_setup_sequence(struct nfs_client *client,
++int nfs4_setup_sequence(const struct nfs_client *client,
+ 			struct nfs4_sequence_args *args,
+ 			struct nfs4_sequence_res *res,
+ 			struct rpc_task *task)
+ {
++	struct nfs_client *client_non_const = (void*)client;
+ 	struct nfs4_session *session = nfs4_get_session(client);
+ 	struct nfs4_slot_table *tbl  = client->cl_slot_tbl;
+ 	struct nfs4_slot *slot;
+@@ -968,7 +969,7 @@ int nfs4_setup_sequence(struct nfs_client *client,
+ 
+ 		if (likely(!slot->interrupted))
+ 			break;
+-		nfs4_sequence_process_interrupted(client,
++		nfs4_sequence_process_interrupted(client_non_const,
+ 				slot, task->tk_msg.rpc_cred);
+ 	}
+ 
+@@ -1352,6 +1353,8 @@ static int can_open_delegated(struct nfs_delegation *delegation, fmode_t fmode,
+ 		return 0;
+ 	if ((delegation->type & fmode) != fmode)
+ 		return 0;
++	if (test_bit(NFS_DELEGATION_RETURNING, &delegation->flags))
++		return 0;
+ 	switch (claim) {
+ 	case NFS4_OPEN_CLAIM_NULL:
+ 	case NFS4_OPEN_CLAIM_FH:
+@@ -1517,10 +1520,9 @@ static void nfs_clear_open_stateid(struct nfs4_state *state,
+ static void nfs_set_open_stateid_locked(struct nfs4_state *state,
+ 		const nfs4_stateid *stateid, nfs4_stateid *freeme)
+ {
+-	unsigned long deadline = jiffies + 5 * HZ;
+-	DEFINE_WAIT(wait);
+ 	struct wait_queue_head *wq_head = bit_waitqueue(&state->flags,
+ 							NFS_STATE_CHANGE_WAIT);
++	DEFINE_WAIT_BIT(wbq_entry, &state->flags, NFS_STATE_CHANGE_WAIT);
+ 	int status = 0;
+ 	for (;;) {
+ 
+@@ -1534,7 +1536,7 @@ static void nfs_set_open_stateid_locked(struct nfs4_state *state,
+ 		if (!nfs4_has_session(NFS_SERVER(state->inode)->nfs_client))
+ 			break;
+ 
+-		prepare_to_wait(wq_head, &wait, TASK_KILLABLE);
++		prepare_to_wait(wq_head, &wbq_entry.wq_entry, TASK_KILLABLE);
+ 		/*
+ 		 * Ensure we process the state changes in the same order
+ 		 * in which the server processed them by delaying the
+@@ -1544,14 +1546,13 @@ static void nfs_set_open_stateid_locked(struct nfs4_state *state,
+ 		spin_unlock(&state->owner->so_lock);
+ 		rcu_read_unlock();
+ 		if (!signal_pending(current)) {
+-			if (schedule_timeout(5*HZ) == 0 ||
+-			    time_after(jiffies, deadline))
++			if (schedule_timeout(5*HZ) == 0)
+ 				status = -EAGAIN;
+ 			else
+ 				status = 0;
+ 		} else
+ 			status = -EINTR;
+-		finish_wait(wq_head, &wait);
++		finish_wait(wq_head, &wbq_entry.wq_entry);
+ 		rcu_read_lock();
+ 		spin_lock(&state->owner->so_lock);
+ 		write_seqlock(&state->seqlock);
+@@ -1714,6 +1715,7 @@ static void nfs4_return_incompatible_delegation(struct inode *inode, fmode_t fmo
+ static struct nfs4_state *nfs4_try_open_cached(struct nfs4_opendata *opendata)
+ {
+ 	struct nfs4_state *state = opendata->state;
++	struct nfs_inode *nfsi = NFS_I(state->inode);
+ 	struct nfs_delegation *delegation;
+ 	int open_mode = opendata->o_arg.open_flags;
+ 	fmode_t fmode = opendata->o_arg.fmode;
+@@ -1730,7 +1732,7 @@ static struct nfs4_state *nfs4_try_open_cached(struct nfs4_opendata *opendata)
+ 		}
+ 		spin_unlock(&state->owner->so_lock);
+ 		rcu_read_lock();
+-		delegation = nfs4_get_valid_delegation(state->inode);
++		delegation = rcu_dereference(nfsi->delegation);
+ 		if (!can_open_delegated(delegation, fmode, claim)) {
+ 			rcu_read_unlock();
+ 			break;
+@@ -2220,7 +2222,7 @@ static void nfs4_open_prepare(struct rpc_task *task, void *calldata)
+ 					data->o_arg.open_flags, claim))
+ 			goto out_no_action;
+ 		rcu_read_lock();
+-		delegation = nfs4_get_valid_delegation(data->state->inode);
++		delegation = rcu_dereference(NFS_I(data->state->inode)->delegation);
+ 		if (can_open_delegated(delegation, data->o_arg.fmode, claim))
+ 			goto unlock_no_action;
+ 		rcu_read_unlock();
+@@ -2991,11 +2993,6 @@ static struct nfs4_state *nfs4_do_open(struct inode *dir,
+ 			exception.retry = 1;
+ 			continue;
+ 		}
+-		if (status == -NFS4ERR_EXPIRED) {
+-			nfs4_schedule_lease_recovery(server->nfs_client);
+-			exception.retry = 1;
+-			continue;
+-		}
+ 		if (status == -EAGAIN) {
+ 			/* We must have found a delegation */
+ 			exception.retry = 1;
+@@ -3214,21 +3211,13 @@ static void nfs4_close_done(struct rpc_task *task, void *data)
+ 
+ 			}
+ 			break;
+-		case -NFS4ERR_OLD_STATEID:
+-			/* Did we race with OPEN? */
+-			if (nfs4_refresh_open_stateid(&calldata->arg.stateid,
+-						state)) {
+-				task->tk_status = 0;
+-				rpc_restart_call_prepare(task);
+-			}
+-			goto out_release;
+ 		case -NFS4ERR_ADMIN_REVOKED:
+ 		case -NFS4ERR_STALE_STATEID:
+ 		case -NFS4ERR_EXPIRED:
+ 			nfs4_free_revoked_stateid(server,
+ 					&calldata->arg.stateid,
+ 					task->tk_msg.rpc_cred);
+-			/* Fallthrough */
++		case -NFS4ERR_OLD_STATEID:
+ 		case -NFS4ERR_BAD_STATEID:
+ 			if (!nfs4_stateid_match(&calldata->arg.stateid,
+ 						&state->open_stateid)) {
+@@ -3237,7 +3226,6 @@ static void nfs4_close_done(struct rpc_task *task, void *data)
+ 			}
+ 			if (calldata->arg.fmode == 0)
+ 				break;
+-			/* Fallthrough */
+ 		default:
+ 			if (nfs4_async_handle_error(task, server, state, NULL) == -EAGAIN) {
+ 				rpc_restart_call_prepare(task);
+@@ -4474,12 +4462,12 @@ static int _nfs4_proc_readdir(struct dentry *dentry, const struct cred *cred,
+ 		u64 cookie, struct page **pages, unsigned int count, int plus)
+ {
+ 	struct inode		*dir = d_inode(dentry);
+-	struct nfs_server	*server = NFS_SERVER(dir);
+ 	struct nfs4_readdir_arg args = {
+ 		.fh = NFS_FH(dir),
+ 		.pages = pages,
+ 		.pgbase = 0,
+ 		.count = count,
++		.bitmask = NFS_SERVER(d_inode(dentry))->attr_bitmask,
+ 		.plus = plus,
+ 	};
+ 	struct nfs4_readdir_res res;
+@@ -4494,15 +4482,9 @@ static int _nfs4_proc_readdir(struct dentry *dentry, const struct cred *cred,
+ 	dprintk("%s: dentry = %pd2, cookie = %Lu\n", __func__,
+ 			dentry,
+ 			(unsigned long long)cookie);
+-	if (!(server->caps & NFS_CAP_SECURITY_LABEL))
+-		args.bitmask = server->attr_bitmask_nl;
+-	else
+-		args.bitmask = server->attr_bitmask;
+-
+ 	nfs4_setup_readdir(cookie, NFS_I(dir)->cookieverf, dentry, &args);
+ 	res.pgbase = args.pgbase;
+-	status = nfs4_call_sync(server->client, server, &msg, &args.seq_args,
+-			&res.seq_res, 0);
++	status = nfs4_call_sync(NFS_SERVER(dir)->client, NFS_SERVER(dir), &msg, &args.seq_args, &res.seq_res, 0);
+ 	if (status >= 0) {
+ 		memcpy(NFS_I(dir)->cookieverf, res.verifier.data, NFS4_VERIFIER_SIZE);
+ 		status += args.pgbase;
+@@ -4642,13 +4624,16 @@ static int _nfs4_do_fsinfo(struct nfs_server *server, struct nfs_fh *fhandle,
+ static int nfs4_do_fsinfo(struct nfs_server *server, struct nfs_fh *fhandle, struct nfs_fsinfo *fsinfo)
+ {
+ 	struct nfs4_exception exception = { };
++	unsigned long now = jiffies;
+ 	int err;
+ 
+ 	do {
+ 		err = _nfs4_do_fsinfo(server, fhandle, fsinfo);
+ 		trace_nfs4_fsinfo(server, fhandle, fsinfo->fattr, err);
+ 		if (err == 0) {
+-			nfs4_set_lease_period(server->nfs_client, fsinfo->lease_time * HZ);
++			nfs4_set_lease_period(server->nfs_client,
++					fsinfo->lease_time * HZ,
++					now);
+ 			break;
+ 		}
+ 		err = nfs4_handle_exception(server, err, &exception);
+@@ -5355,6 +5340,8 @@ static int _nfs4_get_security_label(struct inode *inode, void *buf,
+ 		return ret;
+ 	if (!(fattr.valid & NFS_ATTR_FATTR_V4_SECURITY_LABEL))
+ 		return -ENOENT;
++	if (buflen < label.len)
++		return -ERANGE;
+ 	return 0;
+ }
+ 
+@@ -5500,8 +5487,6 @@ nfs4_init_nonuniform_client_string(struct nfs_client *clp)
+ 		1 +
+ 		strlen(rpc_peeraddr2str(clp->cl_rpcclient, RPC_DISPLAY_PROTO)) +
+ 		1;
+-	if (clp->cl_xprt_id != 0)
+-		len += ilog2(clp->cl_xprt_id)/3 + 2;
+ 	rcu_read_unlock();
+ 
+ 	if (len > NFS4_OPAQUE_LIMIT + 1)
+@@ -5517,17 +5502,10 @@ nfs4_init_nonuniform_client_string(struct nfs_client *clp)
+ 		return -ENOMEM;
+ 
+ 	rcu_read_lock();
+-	if (clp->cl_xprt_id != 0)
+-		scnprintf(str, len, "Linux NFSv4.0 %s/%s %s %d",
+-			  clp->cl_ipaddr,
+-			  rpc_peeraddr2str(clp->cl_rpcclient, RPC_DISPLAY_ADDR),
+-			  rpc_peeraddr2str(clp->cl_rpcclient, RPC_DISPLAY_PROTO),
+-			  clp->cl_xprt_id);
+-	else
+-		scnprintf(str, len, "Linux NFSv4.0 %s/%s %s",
+-			  clp->cl_ipaddr,
+-			  rpc_peeraddr2str(clp->cl_rpcclient, RPC_DISPLAY_ADDR),
+-			  rpc_peeraddr2str(clp->cl_rpcclient, RPC_DISPLAY_PROTO));
++	scnprintf(str, len, "Linux NFSv4.0 %s/%s %s",
++			clp->cl_ipaddr,
++			rpc_peeraddr2str(clp->cl_rpcclient, RPC_DISPLAY_ADDR),
++			rpc_peeraddr2str(clp->cl_rpcclient, RPC_DISPLAY_PROTO));
+ 	rcu_read_unlock();
+ 
+ 	clp->cl_owner_id = str;
+@@ -5543,8 +5521,6 @@ nfs4_init_uniquifier_client_string(struct nfs_client *clp)
+ 	len = 10 + 10 + 1 + 10 + 1 +
+ 		strlen(nfs4_client_id_uniquifier) + 1 +
+ 		strlen(clp->cl_rpcclient->cl_nodename) + 1;
+-	if (clp->cl_xprt_id != 0)
+-		len += ilog2(clp->cl_xprt_id)/3 + 2;
+ 
+ 	if (len > NFS4_OPAQUE_LIMIT + 1)
+ 		return -EINVAL;
+@@ -5558,17 +5534,10 @@ nfs4_init_uniquifier_client_string(struct nfs_client *clp)
+ 	if (!str)
+ 		return -ENOMEM;
+ 
+-	if (clp->cl_xprt_id != 0)
+-		scnprintf(str, len, "Linux NFSv%u.%u %s/%s %d",
+-			  clp->rpc_ops->version, clp->cl_minorversion,
+-			  nfs4_client_id_uniquifier,
+-			  clp->cl_rpcclient->cl_nodename,
+-			  clp->cl_xprt_id);
+-	else
+-		scnprintf(str, len, "Linux NFSv%u.%u %s/%s",
+-			  clp->rpc_ops->version, clp->cl_minorversion,
+-			  nfs4_client_id_uniquifier,
+-			  clp->cl_rpcclient->cl_nodename);
++	scnprintf(str, len, "Linux NFSv%u.%u %s/%s",
++			clp->rpc_ops->version, clp->cl_minorversion,
++			nfs4_client_id_uniquifier,
++			clp->cl_rpcclient->cl_nodename);
+ 	clp->cl_owner_id = str;
+ 	return 0;
+ }
+@@ -5665,9 +5634,8 @@ int nfs4_proc_setclientid(struct nfs_client *clp, u32 program,
+ 		.rpc_message = &msg,
+ 		.callback_ops = &nfs4_setclientid_ops,
+ 		.callback_data = &setclientid,
+-		.flags = RPC_TASK_TIMEOUT | RPC_TASK_NO_ROUND_ROBIN,
++		.flags = RPC_TASK_TIMEOUT,
+ 	};
+-	unsigned long now = jiffies;
+ 	int status;
+ 
+ 	/* nfs_client_id4 */
+@@ -5700,14 +5668,10 @@ int nfs4_proc_setclientid(struct nfs_client *clp, u32 program,
+ 	}
+ 	status = task->tk_status;
+ 	if (setclientid.sc_cred) {
+-		kfree(clp->cl_acceptor);
+ 		clp->cl_acceptor = rpcauth_stringify_acceptor(setclientid.sc_cred);
+ 		put_rpccred(setclientid.sc_cred);
+ 	}
+ 	rpc_put_task(task);
+-
+-	if (status == 0)
+-		do_renew_lease(clp, now);
+ out:
+ 	trace_nfs4_setclientid(clp, status);
+ 	dprintk("NFS reply setclientid: %d\n", status);
+@@ -5736,8 +5700,7 @@ int nfs4_proc_setclientid_confirm(struct nfs_client *clp,
+ 	dprintk("NFS call  setclientid_confirm auth=%s, (client ID %llx)\n",
+ 		clp->cl_rpcclient->cl_auth->au_ops->au_name,
+ 		clp->cl_clientid);
+-	status = rpc_call_sync(clp->cl_rpcclient, &msg,
+-			       RPC_TASK_TIMEOUT | RPC_TASK_NO_ROUND_ROBIN);
++	status = rpc_call_sync(clp->cl_rpcclient, &msg, RPC_TASK_TIMEOUT);
+ 	trace_nfs4_setclientid_confirm(clp, status);
+ 	dprintk("NFS reply setclientid_confirm: %d\n", status);
+ 	return status;
+@@ -5805,17 +5768,9 @@ static void nfs4_delegreturn_done(struct rpc_task *task, void *calldata)
+ 		nfs4_free_revoked_stateid(data->res.server,
+ 				data->args.stateid,
+ 				task->tk_msg.rpc_cred);
+-		/* Fallthrough */
+ 	case -NFS4ERR_BAD_STATEID:
+-	case -NFS4ERR_STALE_STATEID:
+-		task->tk_status = 0;
+-		break;
+ 	case -NFS4ERR_OLD_STATEID:
+-		if (nfs4_refresh_delegation_stateid(&data->stateid, data->inode)) {
+-			task->tk_status = 0;
+-			rpc_restart_call_prepare(task);
+-			return;
+-		}
++	case -NFS4ERR_STALE_STATEID:
+ 		task->tk_status = 0;
+ 		break;
+ 	case -NFS4ERR_ACCESS:
+@@ -5857,10 +5812,8 @@ static void nfs4_delegreturn_prepare(struct rpc_task *task, void *data)
+ 
+ 	d_data = (struct nfs4_delegreturndata *)data;
+ 
+-	if (!d_data->lr.roc && nfs4_wait_on_layoutreturn(d_data->inode, task)) {
+-		nfs4_sequence_done(task, &d_data->res.seq_res);
++	if (!d_data->lr.roc && nfs4_wait_on_layoutreturn(d_data->inode, task))
+ 		return;
+-	}
+ 
+ 	nfs4_setup_sequence(d_data->res.server->nfs_client,
+ 			&d_data->args.seq_args,
+@@ -6446,9 +6399,9 @@ static int _nfs4_do_setlk(struct nfs4_state *state, int cmd, struct file_lock *f
+ 					data->arg.new_lock_owner, ret);
+ 	} else
+ 		data->cancelled = 1;
+-	trace_nfs4_set_lock(fl, state, &data->res.stateid, cmd, ret);
+ 	rpc_put_task(task);
+ 	dprintk("%s: done, ret = %d!\n", __func__, ret);
++	trace_nfs4_set_lock(fl, state, &data->res.stateid, cmd, ret);
+ 	return ret;
+ }
+ 
+@@ -7283,7 +7236,7 @@ static int _nfs4_proc_secinfo(struct inode *dir, const struct qstr *name, struct
+ 		NFS_SP4_MACH_CRED_SECINFO, &clnt, &msg);
+ 
+ 	status = nfs4_call_sync(clnt, NFS_SERVER(dir), &msg, &args.seq_args,
+-				&res.seq_res, RPC_TASK_NO_ROUND_ROBIN);
++				&res.seq_res, 0);
+ 	dprintk("NFS reply  secinfo: %d\n", status);
+ 
+ 	put_cred(cred);
+@@ -7325,11 +7278,9 @@ int nfs4_proc_secinfo(struct inode *dir, const struct qstr *name,
+  * both PNFS and NON_PNFS flags set, and not having one of NON_PNFS, PNFS, or
+  * DS flags set.
+  */
+-static int nfs4_check_cl_exchange_flags(u32 flags, u32 version)
++static int nfs4_check_cl_exchange_flags(u32 flags)
+ {
+-	if (version >= 2 && (flags & ~EXCHGID4_2_FLAG_MASK_R))
+-		goto out_inval;
+-	else if (version < 2 && (flags & ~EXCHGID4_FLAG_MASK_R))
++	if (flags & ~EXCHGID4_FLAG_MASK_R)
+ 		goto out_inval;
+ 	if ((flags & EXCHGID4_FLAG_USE_PNFS_MDS) &&
+ 	    (flags & EXCHGID4_FLAG_USE_NON_PNFS))
+@@ -7353,15 +7304,6 @@ nfs41_same_server_scope(struct nfs41_server_scope *a,
+ static void
+ nfs4_bind_one_conn_to_session_done(struct rpc_task *task, void *calldata)
+ {
+-	struct nfs41_bind_conn_to_session_args *args = task->tk_msg.rpc_argp;
+-	struct nfs41_bind_conn_to_session_res *res = task->tk_msg.rpc_resp;
+-
+-	if (args->dir == NFS4_CDFC4_FORE_OR_BOTH &&
+-			res->dir != NFS4_CDFS4_BOTH) {
+-		rpc_task_close_connection(task);
+-		if (args->retries++ < MAX_BIND_CONN_TO_SESSION_RETRIES)
+-			rpc_restart_call(task);
+-	}
+ }
+ 
+ static const struct rpc_call_ops nfs4_bind_one_conn_to_session_ops = {
+@@ -7384,7 +7326,6 @@ int nfs4_proc_bind_one_conn_to_session(struct rpc_clnt *clnt,
+ 	struct nfs41_bind_conn_to_session_args args = {
+ 		.client = clp,
+ 		.dir = NFS4_CDFC4_FORE_OR_BOTH,
+-		.retries = 0,
+ 	};
+ 	struct nfs41_bind_conn_to_session_res res;
+ 	struct rpc_message msg = {
+@@ -7606,8 +7547,7 @@ static void nfs4_exchange_id_done(struct rpc_task *task, void *data)
+ 	trace_nfs4_exchange_id(clp, status);
+ 
+ 	if (status == 0)
+-		status = nfs4_check_cl_exchange_flags(cdata->res.flags,
+-						      clp->cl_mvops->minor_version);
++		status = nfs4_check_cl_exchange_flags(cdata->res.flags);
+ 
+ 	if (cdata->xprt && status == 0) {
+ 		status = nfs4_detect_session_trunking(clp, &cdata->res,
+@@ -7693,12 +7633,10 @@ static int _nfs4_proc_exchange_id(struct nfs_client *clp, const struct cred *cre
+ 		.rpc_client = clp->cl_rpcclient,
+ 		.callback_ops = &nfs4_exchange_id_call_ops,
+ 		.rpc_message = &msg,
+-		.flags = RPC_TASK_TIMEOUT | RPC_TASK_NO_ROUND_ROBIN,
++		.flags = RPC_TASK_TIMEOUT,
+ 	};
+ 	struct nfs41_exchange_id_data *calldata;
+ 	struct rpc_task *task;
+-	unsigned long now = jiffies;
+-
+ 	int status;
+ 
+ 	if (!atomic_inc_not_zero(&clp->cl_count))
+@@ -7773,9 +7711,6 @@ static int _nfs4_proc_exchange_id(struct nfs_client *clp, const struct cred *cre
+ 	status = calldata->rpc_status;
+ 
+ 	rpc_put_task(task);
+-
+-	if (status == 0)
+-		do_renew_lease(clp, now);
+ out:
+ 	return status;
+ 
+@@ -7864,8 +7799,7 @@ static int _nfs4_proc_destroy_clientid(struct nfs_client *clp,
+ 	};
+ 	int status;
+ 
+-	status = rpc_call_sync(clp->cl_rpcclient, &msg,
+-			       RPC_TASK_TIMEOUT | RPC_TASK_NO_ROUND_ROBIN);
++	status = rpc_call_sync(clp->cl_rpcclient, &msg, RPC_TASK_TIMEOUT);
+ 	trace_nfs4_destroy_clientid(clp, status);
+ 	if (status)
+ 		dprintk("NFS: Got error %d from the server %s on "
+@@ -8145,8 +8079,7 @@ static int _nfs4_proc_create_session(struct nfs_client *clp,
+ 	nfs4_init_channel_attrs(&args, clp->cl_rpcclient);
+ 	args.flags = (SESSION4_PERSIST | SESSION4_BACK_CHAN);
+ 
+-	status = rpc_call_sync(session->clp->cl_rpcclient, &msg,
+-			       RPC_TASK_TIMEOUT | RPC_TASK_NO_ROUND_ROBIN);
++	status = rpc_call_sync(session->clp->cl_rpcclient, &msg, RPC_TASK_TIMEOUT);
+ 	trace_nfs4_create_session(clp, status);
+ 
+ 	switch (status) {
+@@ -8222,8 +8155,7 @@ int nfs4_proc_destroy_session(struct nfs4_session *session,
+ 	if (!test_and_clear_bit(NFS4_SESSION_ESTABLISHED, &session->session_state))
+ 		return 0;
+ 
+-	status = rpc_call_sync(session->clp->cl_rpcclient, &msg,
+-			       RPC_TASK_TIMEOUT | RPC_TASK_NO_ROUND_ROBIN);
++	status = rpc_call_sync(session->clp->cl_rpcclient, &msg, RPC_TASK_TIMEOUT);
+ 	trace_nfs4_destroy_session(session->clp, status);
+ 
+ 	if (status)
+@@ -8477,7 +8409,7 @@ static int nfs41_proc_reclaim_complete(struct nfs_client *clp,
+ 		.rpc_client = clp->cl_rpcclient,
+ 		.rpc_message = &msg,
+ 		.callback_ops = &nfs4_reclaim_complete_call_ops,
+-		.flags = RPC_TASK_ASYNC | RPC_TASK_NO_ROUND_ROBIN,
++		.flags = RPC_TASK_ASYNC,
+ 	};
+ 	int status = -ENOMEM;
+ 
+@@ -9038,7 +8970,7 @@ _nfs41_proc_secinfo_no_name(struct nfs_server *server, struct nfs_fh *fhandle,
+ 
+ 	dprintk("--> %s\n", __func__);
+ 	status = nfs4_call_sync(clnt, server, &msg, &args.seq_args,
+-				&res.seq_res, RPC_TASK_NO_ROUND_ROBIN);
++				&res.seq_res, 0);
+ 	dprintk("<-- %s status=%d\n", __func__, status);
+ 
+ 	put_cred(cred);
+@@ -9446,6 +9378,11 @@ static const struct nfs4_minor_version_ops nfs_v4_0_minor_ops = {
+ };
+ 
+ #if defined(CONFIG_NFS_V4_1)
++static struct nfs_seqid *
++nfs_alloc_no_seqid(struct nfs_seqid_counter *arg1, gfp_t arg2)
++{
++	return NULL;
++}
+ 
+ static const struct nfs4_minor_version_ops nfs_v4_1_minor_ops = {
+ 	.minor_version = 1,
+@@ -9460,7 +9397,7 @@ static const struct nfs4_minor_version_ops nfs_v4_1_minor_ops = {
+ 	.find_root_sec = nfs41_find_root_sec,
+ 	.free_lock_state = nfs41_free_lock_state,
+ 	.test_and_free_expired = nfs41_test_and_free_expired_stateid,
+-	.alloc_seqid = nfs_alloc_seqid,
++	.alloc_seqid = nfs_alloc_no_seqid,
+ 	.session_trunk = nfs4_test_session_trunk,
+ 	.call_sync_ops = &nfs41_call_sync_ops,
+ 	.reboot_recovery_ops = &nfs41_reboot_recovery_ops,
+@@ -9491,7 +9428,7 @@ static const struct nfs4_minor_version_ops nfs_v4_2_minor_ops = {
+ 	.free_lock_state = nfs41_free_lock_state,
+ 	.call_sync_ops = &nfs41_call_sync_ops,
+ 	.test_and_free_expired = nfs41_test_and_free_expired_stateid,
+-	.alloc_seqid = nfs_alloc_seqid,
++	.alloc_seqid = nfs_alloc_no_seqid,
+ 	.session_trunk = nfs4_test_session_trunk,
+ 	.reboot_recovery_ops = &nfs41_reboot_recovery_ops,
+ 	.nograce_recovery_ops = &nfs41_nograce_recovery_ops,
+diff --git a/bundle/fs/nfs/nfs4renewd.c b/bundle/fs/nfs/nfs4renewd.c
+index e1a70ae7e..dbab47999 100644
+--- a/bundle/fs/nfs/nfs4renewd.c
++++ b/bundle/fs/nfs/nfs4renewd.c
+@@ -139,12 +139,15 @@ nfs4_kill_renewd(struct nfs_client *clp)
+  *
+  * @clp: pointer to nfs_client
+  * @lease: new value for lease period
++ * @lastrenewed: time at which lease was last renewed
+  */
+ void nfs4_set_lease_period(struct nfs_client *clp,
+-		unsigned long lease)
++		unsigned long lease,
++		unsigned long lastrenewed)
+ {
+ 	spin_lock(&clp->cl_lock);
+ 	clp->cl_lease_time = lease;
++	clp->cl_last_renewal = lastrenewed;
+ 	spin_unlock(&clp->cl_lock);
+ 
+ 	/* Cap maximum reconnect timeout at 1/2 lease period */
+diff --git a/bundle/fs/nfs/nfs4state.c b/bundle/fs/nfs/nfs4state.c
+index ec257a4cb..ba854e6e5 100644
+--- a/bundle/fs/nfs/nfs4state.c
++++ b/bundle/fs/nfs/nfs4state.c
+@@ -275,15 +275,17 @@ static int nfs41_setup_state_renewal(struct nfs_client *clp)
+ {
+ 	int status;
+ 	struct nfs_fsinfo fsinfo;
++	unsigned long now;
+ 
+ 	if (!test_bit(NFS_CS_CHECK_LEASE_TIME, &clp->cl_res_state)) {
+ 		nfs4_schedule_state_renewal(clp);
+ 		return 0;
+ 	}
+ 
++	now = jiffies;
+ 	status = nfs4_proc_get_lease_time(clp, &fsinfo);
+ 	if (status == 0) {
+-		nfs4_set_lease_period(clp, fsinfo.lease_time * HZ);
++		nfs4_set_lease_period(clp, fsinfo.lease_time * HZ, now);
+ 		nfs4_schedule_state_renewal(clp);
+ 	}
+ 
+@@ -992,22 +994,6 @@ out:
+ 	return ret;
+ }
+ 
+-bool nfs4_refresh_open_stateid(nfs4_stateid *dst, struct nfs4_state *state)
+-{
+-	bool ret;
+-	int seq;
+-
+-	do {
+-		ret = false;
+-		seq = read_seqbegin(&state->seqlock);
+-		if (nfs4_state_match_open_stateid_other(state, dst)) {
+-			dst->seqid = state->open_stateid.seqid;
+-			ret = true;
+-		}
+-	} while (read_seqretry(&state->seqlock, seq));
+-	return ret;
+-}
+-
+ static void nfs4_copy_open_stateid(nfs4_stateid *dst, struct nfs4_state *state)
+ {
+ 	const nfs4_stateid *src;
+@@ -2291,7 +2277,8 @@ static void nfs41_handle_recallable_state_revoked(struct nfs_client *clp)
+ {
+ 	/* FIXME: For now, we destroy all layouts. */
+ 	pnfs_destroy_all_layouts(clp);
+-	nfs_test_expired_all_delegations(clp);
++	/* FIXME: For now, we test all delegations+open state+locks. */
++	nfs41_handle_some_state_revoked(clp);
+ 	dprintk("%s: Recallable state revoked on server %s!\n", __func__,
+ 			clp->cl_hostname);
+ }
+diff --git a/bundle/fs/nfs/nfs4xdr.c b/bundle/fs/nfs/nfs4xdr.c
+index 21be6d371..2aa9cb5e5 100644
+--- a/bundle/fs/nfs/nfs4xdr.c
++++ b/bundle/fs/nfs/nfs4xdr.c
+@@ -4211,11 +4211,7 @@ static int decode_attr_security_label(struct xdr_stream *xdr, uint32_t *bitmap,
+ 			goto out_overflow;
+ 		if (len < NFS4_MAXLABELLEN) {
+ 			if (label) {
+-				if (label->len) {
+-					if (label->len < len)
+-						return -ERANGE;
+-					memcpy(label->label, p, len);
+-				}
++				memcpy(label->label, p, len);
+ 				label->len = len;
+ 				label->pi = pi;
+ 				label->lfs = lfs;
+@@ -4366,14 +4362,11 @@ static int decode_write_verifier(struct xdr_stream *xdr, struct nfs_write_verifi
+ 
+ static int decode_commit(struct xdr_stream *xdr, struct nfs_commitres *res)
+ {
+-	struct nfs_writeverf *verf = res->verf;
+ 	int status;
+ 
+ 	status = decode_op_hdr(xdr, OP_COMMIT);
+ 	if (!status)
+-		status = decode_write_verifier(xdr, &verf->verifier);
+-	if (!status)
+-		verf->committed = NFS_FILE_SYNC;
++		status = decode_write_verifier(xdr, &res->verf->verifier);
+ 	return status;
+ }
+ 
+diff --git a/bundle/fs/nfs/pagelist.c b/bundle/fs/nfs/pagelist.c
+index dc2237ff6..0cb65282b 100644
+--- a/bundle/fs/nfs/pagelist.c
++++ b/bundle/fs/nfs/pagelist.c
+@@ -50,7 +50,7 @@ void nfs_pgheader_init(struct nfs_pageio_descriptor *desc,
+ 	hdr->cred = hdr->req->wb_context->cred;
+ 	hdr->io_start = req_offset(hdr->req);
+ 	hdr->good_bytes = mirror->pg_count;
+-	hdr->io_completion = desc->pg_io_completion;
++	hdr->io_completion = *pg_io_completion(desc);
+ 	hdr->dreq = desc->pg_dreq;
+ 	hdr->layout_private = desc->pg_layout_private;
+ 	hdr->release = release;
+@@ -713,7 +713,6 @@ void nfs_pageio_init(struct nfs_pageio_descriptor *desc,
+ 	desc->pg_ioflags = io_flags;
+ 	desc->pg_error = 0;
+ 	desc->pg_lseg = NULL;
+-	desc->pg_io_completion = NULL;
+ 	desc->pg_dreq = NULL;
+ 	desc->pg_layout_private = NULL;
+ 	desc->pg_bsize = bsize;
+@@ -724,6 +723,7 @@ void nfs_pageio_init(struct nfs_pageio_descriptor *desc,
+ 	desc->pg_mirrors_dynamic = NULL;
+ 	desc->pg_mirrors = desc->pg_mirrors_static;
+ 	nfs_pageio_mirror_init(&desc->pg_mirrors[0], bsize);
++	*pg_io_completion(desc) = NULL;
+ }
+ EXPORT_SYMBOL_GPL(nfs_pageio_init);
+ 
+@@ -870,13 +870,19 @@ static void nfs_pageio_setup_mirroring(struct nfs_pageio_descriptor *pgio,
+ 				       struct nfs_page *req)
+ {
+ 	unsigned int mirror_count = 1;
++	struct nfs_io_completion *iocomp = *pg_io_completion(pgio);
++
++	*pg_io_completion(pgio) = NULL;
+ 
+ 	if (pgio->pg_ops->pg_get_mirror_count)
+ 		mirror_count = pgio->pg_ops->pg_get_mirror_count(pgio, req);
+-	if (mirror_count == pgio->pg_mirror_count || pgio->pg_error < 0)
++	if (mirror_count == pgio->pg_mirror_count || pgio->pg_error < 0) {
++		*pg_io_completion(pgio) = iocomp;
+ 		return;
++	}
+ 
+ 	if (!mirror_count || mirror_count > NFS_PAGEIO_DESCRIPTOR_MIRROR_MAX) {
++		*pg_io_completion(pgio) = iocomp;
+ 		pgio->pg_error = -EINVAL;
+ 		return;
+ 	}
+@@ -888,6 +894,7 @@ static void nfs_pageio_setup_mirroring(struct nfs_pageio_descriptor *pgio,
+ 		mirror_count = 1;
+ 	}
+ 	pgio->pg_mirror_count = mirror_count;
++	*pg_io_completion(pgio) = iocomp;
+ }
+ 
+ /*
+@@ -901,11 +908,14 @@ void nfs_pageio_stop_mirroring(struct nfs_pageio_descriptor *pgio)
+ 
+ static void nfs_pageio_cleanup_mirroring(struct nfs_pageio_descriptor *pgio)
+ {
++	struct nfs_io_completion *iocomp = *pg_io_completion(pgio);
++	*pg_io_completion(pgio) = NULL;
+ 	pgio->pg_mirror_count = 1;
+ 	pgio->pg_mirror_idx = 0;
+ 	pgio->pg_mirrors = pgio->pg_mirrors_static;
+ 	kfree(pgio->pg_mirrors_dynamic);
+ 	pgio->pg_mirrors_dynamic = NULL;
++	*pg_io_completion(pgio) = iocomp;
+ }
+ 
+ static bool nfs_match_lock_context(const struct nfs_lock_context *l1,
+@@ -1261,7 +1271,7 @@ int nfs_pageio_resend(struct nfs_pageio_descriptor *desc,
+ {
+ 	LIST_HEAD(pages);
+ 
+-	desc->pg_io_completion = hdr->io_completion;
++	*pg_io_completion(desc) = hdr->io_completion;
+ 	desc->pg_dreq = hdr->dreq;
+ 	list_splice_init(&hdr->pages, &pages);
+ 	while (!list_empty(&pages)) {
+diff --git a/bundle/fs/nfs/pnfs.c b/bundle/fs/nfs/pnfs.c
+index f40647511..ab28c5566 100644
+--- a/bundle/fs/nfs/pnfs.c
++++ b/bundle/fs/nfs/pnfs.c
+@@ -1371,25 +1371,14 @@ void pnfs_roc_release(struct nfs4_layoutreturn_args *args,
+ 		int ret)
+ {
+ 	struct pnfs_layout_hdr *lo = args->layout;
+-	struct inode *inode = args->inode;
+ 	const nfs4_stateid *arg_stateid = NULL;
+ 	const nfs4_stateid *res_stateid = NULL;
+ 	struct nfs4_xdr_opaque_data *ld_private = args->ld_private;
+ 
+-	switch (ret) {
+-	case -NFS4ERR_NOMATCHING_LAYOUT:
+-		spin_lock(&inode->i_lock);
+-		if (pnfs_layout_is_valid(lo) &&
+-		    nfs4_stateid_match_other(&args->stateid, &lo->plh_stateid))
+-			pnfs_set_plh_return_info(lo, args->range.iomode, 0);
+-		spin_unlock(&inode->i_lock);
+-		break;
+-	case 0:
++	if (ret == 0) {
++		arg_stateid = &args->stateid;
+ 		if (res->lrs_present)
+ 			res_stateid = &res->stateid;
+-		/* Fallthrough */
+-	default:
+-		arg_stateid = &args->stateid;
+ 	}
+ 	pnfs_layoutreturn_free_lsegs(lo, arg_stateid, &args->range,
+ 			res_stateid);
+diff --git a/bundle/fs/nfs/pnfs_nfs.c b/bundle/fs/nfs/pnfs_nfs.c
+index a59707b8d..6e1cdd9b7 100644
+--- a/bundle/fs/nfs/pnfs_nfs.c
++++ b/bundle/fs/nfs/pnfs_nfs.c
+@@ -30,11 +30,12 @@ EXPORT_SYMBOL_GPL(pnfs_generic_rw_release);
+ /* Fake up some data that will cause nfs_commit_release to retry the writes. */
+ void pnfs_generic_prepare_to_resend_writes(struct nfs_commit_data *data)
+ {
+-	struct nfs_writeverf *verf = data->res.verf;
++	struct nfs_page *first = nfs_list_entry(data->pages.next);
+ 
+ 	data->task.tk_status = 0;
+-	memset(&verf->verifier, 0, sizeof(verf->verifier));
+-	verf->committed = NFS_UNSTABLE;
++	memcpy(&data->verf.verifier, &first->wb_verf,
++	       sizeof(data->verf.verifier));
++	data->verf.verifier.data[0]++; /* ensure verifier mismatch */
+ }
+ EXPORT_SYMBOL_GPL(pnfs_generic_prepare_to_resend_writes);
+ 
+diff --git a/bundle/fs/nfs/super.c b/bundle/fs/nfs/super.c
+index ffa740de0..3b4eb867c 100644
+--- a/bundle/fs/nfs/super.c
++++ b/bundle/fs/nfs/super.c
+@@ -101,8 +101,6 @@ enum {
+ 	Opt_rdirplus, Opt_nordirplus,
+ 	Opt_forcerdirplus, Opt_noforcerdirplus,
+ 	Opt_sharecache, Opt_nosharecache,
+-	Opt_sharetransport, Opt_nosharetransport,
+-	Opt_sharetransportid,
+ 	Opt_resvport, Opt_noresvport,
+ 	Opt_fscache, Opt_nofscache,
+ 	Opt_migration, Opt_nomigration,
+@@ -166,9 +164,6 @@ static const match_table_t nfs_mount_option_tokens = {
+ 	{ Opt_noforcerdirplus, "noforcerdirplus" },
+ 	{ Opt_sharecache, "sharecache" },
+ 	{ Opt_nosharecache, "nosharecache" },
+-	{ Opt_sharetransport, "sharetransport"},
+-	{ Opt_nosharetransport, "nosharetransport"},
+-	{ Opt_sharetransportid, "sharetransport=%s"},
+ 	{ Opt_resvport, "resvport" },
+ 	{ Opt_noresvport, "noresvport" },
+ 	{ Opt_fscache, "fsc" },
+@@ -667,7 +662,6 @@ static void nfs_show_mount_options(struct seq_file *m, struct nfs_server *nfss,
+ 		{ NFS_MOUNT_NOACL, ",noacl", "" },
+ 		{ NFS_MOUNT_NORDIRPLUS, ",nordirplus", "" },
+ 		{ NFS_MOUNT_UNSHARED, ",nosharecache", "" },
+-		{ NFS_MOUNT_NOSHARE_XPRT, ",nosharetransport", ""},
+ 		{ NFS_MOUNT_NORESVPORT, ",noresvport", "" },
+ 		{ NFS_MOUNT_FORCE_READDIRPLUS, ",forcerdirplus", "" },
+ 		{ 0, NULL, NULL }
+@@ -697,8 +691,6 @@ static void nfs_show_mount_options(struct seq_file *m, struct nfs_server *nfss,
+ 		else
+ 			seq_puts(m, nfs_infop->nostr);
+ 	}
+-	if (clp->cl_xprt_id)
+-		seq_printf(m, ",sharetransport=%u", clp->cl_xprt_id);
+ 	rcu_read_lock();
+ 	seq_printf(m, ",proto=%s",
+ 		   rpc_peeraddr2str(nfss->client, RPC_DISPLAY_NETID));
+@@ -1473,12 +1465,6 @@ static int nfs_parse_mount_options(char *raw,
+ 		case Opt_nosharecache:
+ 			mnt->flags |= NFS_MOUNT_UNSHARED;
+ 			break;
+-		case Opt_sharetransport:
+-			mnt->flags &= ~NFS_MOUNT_NOSHARE_XPRT;
+-			break;
+-		case Opt_nosharetransport:
+-			mnt->flags |= NFS_MOUNT_NOSHARE_XPRT;
+-			break;
+ 		case Opt_resvport:
+ 			mnt->flags &= ~NFS_MOUNT_NORESVPORT;
+ 			break;
+@@ -1589,12 +1575,6 @@ static int nfs_parse_mount_options(char *raw,
+ 				goto out_invalid_value;
+ 			mnt->minorversion = option;
+ 			break;
+-		case Opt_sharetransportid:
+-			if (nfs_get_option_ul(args, &option) ||
+-			    option <= 0)
+-				goto out_invalid_value;
+-			mnt->xprt_id = option;
+-			break;
+ 
+ 		/*
+ 		 * options that take text values
+@@ -1880,10 +1860,6 @@ static int nfs_parse_mount_options(char *raw,
+ 	    (mnt->version != 4 || mnt->minorversion != 0))
+ 		goto out_migration_misuse;
+ 
+-	if (mnt->flags & NFS_MOUNT_NOSHARE_XPRT &&
+-	    mnt->version == 4)
+-		goto out_noshare_misuse;
+-
+ 	/*
+ 	 * verify that any proto=/mountproto= options match the address
+ 	 * families in the addr=/mountaddr= options.
+@@ -1904,10 +1880,6 @@ static int nfs_parse_mount_options(char *raw,
+ 
+ 	return 1;
+ 
+-out_noshare_misuse:
+-	printk(KERN_INFO "NFS: nosharetransport is not compatible with vers=4\n");
+-	printk(KERN_INFO "NFS: use sharetransport=N for some unique N\n");
+-	return 0;
+ out_mountproto_mismatch:
+ 	printk(KERN_INFO "NFS: mount server address does not match mountproto= "
+ 			 "option\n");
+@@ -2495,9 +2467,6 @@ nfs_compare_remount_data(struct nfs_server *nfss,
+ 	return 0;
+ }
+ 
+-static bool always_nosharetransport = 0;
+-module_param(always_nosharetransport, bool, 0644);
+-
+ int
+ nfs_remount(struct super_block *sb, int *flags, char *raw_data)
+ {
+@@ -2548,8 +2517,6 @@ nfs_remount(struct super_block *sb, int *flags, char *raw_data)
+ 	error = -EINVAL;
+ 	if (!nfs_parse_mount_options((char *)options, data))
+ 		goto out;
+-	if (always_nosharetransport)
+-		data->flags |= NFS_MOUNT_NOSHARE_XPRT;
+ 
+ 	/*
+ 	 * noac is a special case. It implies -o sync, but that's not
+@@ -2703,10 +2670,6 @@ static int nfs_compare_super_address(struct nfs_server *server1,
+ 	if (!net_eq(xprt1->xprt_net, xprt2->xprt_net))
+ 		return 0;
+ 
+-	if (server1->nfs_client->cl_xprt_id !=
+-	    server2->nfs_client->cl_xprt_id)
+-		return 0;
+-
+ 	sap1 = (struct sockaddr *)&server1->nfs_client->cl_addr;
+ 	sap2 = (struct sockaddr *)&server2->nfs_client->cl_addr;
+ 
+@@ -2930,8 +2893,6 @@ struct dentry *nfs_fs_mount(struct file_system_type *fs_type,
+ 		mntroot = ERR_PTR(error);
+ 		goto out;
+ 	}
+-	if (always_nosharetransport)
+-		mount_info.parsed->flags |= NFS_MOUNT_NOSHARE_XPRT;
+ 
+ 	nfs_mod = get_nfs_version(mount_info.parsed->version);
+ 	if (IS_ERR(nfs_mod)) {
+diff --git a/bundle/fs/nfs/write.c b/bundle/fs/nfs/write.c
+index 4cb912a14..1ef42cab1 100644
+--- a/bundle/fs/nfs/write.c
++++ b/bundle/fs/nfs/write.c
+@@ -56,7 +56,6 @@ static const struct rpc_call_ops nfs_commit_ops;
+ static const struct nfs_pgio_completion_ops nfs_async_write_completion_ops;
+ static const struct nfs_commit_completion_ops nfs_commit_completion_ops;
+ static const struct nfs_rw_ops nfs_rw_write_ops;
+-static void nfs_inode_remove_request(struct nfs_page *req);
+ static void nfs_clear_request_commit(struct nfs_page *req);
+ static void nfs_init_cinfo_from_inode(struct nfs_commit_info *cinfo,
+ 				      struct inode *inode);
+@@ -223,15 +222,7 @@ out:
+ /* A writeback failed: mark the page as bad, and invalidate the page cache */
+ static void nfs_set_pageerror(struct address_space *mapping)
+ {
+-	struct inode *inode = mapping->host;
+-
+ 	nfs_zap_mapping(mapping->host, mapping);
+-	/* Force file size revalidation */
+-	spin_lock(&inode->i_lock);
+-	NFS_I(inode)->cache_validity |= NFS_INO_REVAL_FORCED |
+-					NFS_INO_REVAL_PAGECACHE |
+-					NFS_INO_INVALID_ATTR;
+-	spin_unlock(&inode->i_lock);
+ }
+ 
+ /*
+@@ -615,10 +606,9 @@ try_again:
+ static void nfs_write_error_remove_page(struct nfs_page *req)
+ {
+ 	nfs_unlock_request(req);
+-	SetPageError(req->wb_page);
+-	nfs_set_pageerror(page_file_mapping(req->wb_page));
+-	nfs_inode_remove_request(req);
+ 	nfs_end_page_writeback(req);
++	generic_error_remove_page(page_file_mapping(req->wb_page),
++				  req->wb_page);
+ 	nfs_release_request(req);
+ }
+ 
+@@ -757,7 +747,7 @@ int nfs_writepages(struct address_space *mapping, struct writeback_control *wbc)
+ 
+ 	nfs_pageio_init_write(&pgio, inode, wb_priority(wbc), false,
+ 				&nfs_async_write_completion_ops);
+-	pgio.pg_io_completion = ioc;
++	*pg_io_completion(&pgio) = ioc;
+ 	err = write_cache_pages(mapping, wbc, nfs_writepages_callback, &pgio);
+ 	nfs_pageio_complete(&pgio);
+ 	nfs_io_completion_put(ioc);
+@@ -982,9 +972,9 @@ nfs_mark_request_commit(struct nfs_page *req, struct pnfs_layout_segment *lseg,
+ static void
+ nfs_clear_page_commit(struct page *page)
+ {
+-	dec_node_page_state(page, NR_WRITEBACK);
++	dec_node_page_state(page, NR_UNSTABLE_NFS);
+ 	dec_wb_stat(&inode_to_bdi(page_file_mapping(page)->host)->wb,
+-		    WB_WRITEBACK);
++		    WB_RECLAIMABLE);
+ }
+ 
+ /* Called holding inode (/cinfo) lock */
+@@ -1854,7 +1844,6 @@ static void nfs_commit_done(struct rpc_task *task, void *calldata)
+ 
+ static void nfs_commit_release_pages(struct nfs_commit_data *data)
+ {
+-	const struct nfs_writeverf *verf = data->res.verf;
+ 	struct nfs_page	*req;
+ 	int status = data->task.tk_status;
+ 	struct nfs_commit_info cinfo;
+@@ -1881,8 +1870,7 @@ static void nfs_commit_release_pages(struct nfs_commit_data *data)
+ 
+ 		/* Okay, COMMIT succeeded, apparently. Check the verifier
+ 		 * returned by the server against all stored verfs. */
+-		if (verf->committed > NFS_UNSTABLE &&
+-		    !nfs_write_verifier_cmp(&req->wb_verf, &verf->verifier)) {
++		if (!nfs_write_verifier_cmp(&req->wb_verf, &data->verf.verifier)) {
+ 			/* We have a match */
+ 			if (req->wb_page)
+ 				nfs_inode_remove_request(req);
+diff --git a/bundle/fs/nfsd/blocklayout.c b/bundle/fs/nfsd/blocklayout.c
+index b933e6b75..509c16a03 100644
+--- a/bundle/fs/nfsd/blocklayout.c
++++ b/bundle/fs/nfsd/blocklayout.c
+@@ -219,14 +219,11 @@ static int nfsd4_scsi_identify_device(struct block_device *bdev,
+ 	u8 *buf, *d, type, assoc;
+ 	int error;
+ 
+-	if (WARN_ON_ONCE(!blk_queue_scsi_passthrough(q)))
+-		return -EINVAL;
+-
+ 	buf = kzalloc(bufflen, GFP_KERNEL);
+ 	if (!buf)
+ 		return -ENOMEM;
+ 
+-	rq = blk_get_request(q, REQ_OP_SCSI_IN, 0);
++	rq = blk_get_request(q, REQ_OP_SCSI_IN, GFP_KERNEL);
+ 	if (IS_ERR(rq)) {
+ 		error = -ENOMEM;
+ 		goto out_free_buf;
+diff --git a/bundle/fs/nfsd/nfs3proc.c b/bundle/fs/nfsd/nfs3proc.c
+index 6adf26fda..4628bedfc 100644
+--- a/bundle/fs/nfsd/nfs3proc.c
++++ b/bundle/fs/nfsd/nfs3proc.c
+@@ -191,7 +191,6 @@ nfsd3_proc_write(struct svc_rqst *rqstp)
+ 	struct nfsd3_writeres *resp = rqstp->rq_resp;
+ 	__be32	nfserr;
+ 	unsigned long cnt = argp->len;
+-	unsigned int nvecs;
+ 
+ 	dprintk("nfsd: WRITE(3)    %s %d bytes at %Lu%s\n",
+ 				SVCFH_fmt(&argp->fh),
+@@ -201,13 +200,9 @@ nfsd3_proc_write(struct svc_rqst *rqstp)
+ 
+ 	fh_copy(&resp->fh, &argp->fh);
+ 	resp->committed = argp->stable;
+-	nvecs = svc_fill_write_vector(rqstp, rqstp->rq_arg.pages,
+-				      &argp->first, cnt);
+-	if (!nvecs)
+-		RETURN_STATUS(nfserr_io);
+ 	nfserr = nfsd_write(rqstp, &resp->fh, argp->offset,
+-			    rqstp->rq_vec, nvecs, &cnt,
+-			    resp->committed);
++				rqstp->rq_vec, argp->vlen,
++				&cnt, resp->committed);
+ 	resp->count = cnt;
+ 	RETURN_STATUS(nfserr);
+ }
+@@ -283,17 +278,6 @@ nfsd3_proc_symlink(struct svc_rqst *rqstp)
+ 	struct nfsd3_diropres *resp = rqstp->rq_resp;
+ 	__be32	nfserr;
+ 
+-	if (argp->tlen == 0)
+-		RETURN_STATUS(nfserr_inval);
+-	if (argp->tlen > NFS3_MAXPATHLEN)
+-		RETURN_STATUS(nfserr_nametoolong);
+-
+-	argp->tname = svc_fill_symlink_pathname(rqstp, &argp->first,
+-						page_address(rqstp->rq_arg.pages[0]),
+-						argp->tlen);
+-	if (IS_ERR(argp->tname))
+-		RETURN_STATUS(nfserrno(PTR_ERR(argp->tname)));
+-
+ 	dprintk("nfsd: SYMLINK(3)  %s %.*s -> %.*s\n",
+ 				SVCFH_fmt(&argp->ffh),
+ 				argp->flen, argp->fname,
+@@ -303,7 +287,6 @@ nfsd3_proc_symlink(struct svc_rqst *rqstp)
+ 	fh_init(&resp->fh, NFS3_FHSIZE);
+ 	nfserr = nfsd_symlink(rqstp, &resp->dirfh, argp->fname, argp->flen,
+ 						   argp->tname, &resp->fh);
+-	kfree(argp->tname);
+ 	RETURN_STATUS(nfserr);
+ }
+ 
+diff --git a/bundle/fs/nfsd/nfs3xdr.c b/bundle/fs/nfsd/nfs3xdr.c
+index e84fc1187..c196a82e0 100644
+--- a/bundle/fs/nfsd/nfs3xdr.c
++++ b/bundle/fs/nfsd/nfs3xdr.c
+@@ -362,7 +362,7 @@ int
+ nfs3svc_decode_writeargs(struct svc_rqst *rqstp, __be32 *p)
+ {
+ 	struct nfsd3_writeargs *args = rqstp->rq_argp;
+-	unsigned int len, hdr, dlen;
++	unsigned int len, v, hdr, dlen;
+ 	u32 max_blocksize = svc_max_payload(rqstp);
+ 	struct kvec *head = rqstp->rq_arg.head;
+ 	struct kvec *tail = rqstp->rq_arg.tail;
+@@ -404,9 +404,17 @@ nfs3svc_decode_writeargs(struct svc_rqst *rqstp, __be32 *p)
+ 		args->count = max_blocksize;
+ 		len = args->len = max_blocksize;
+ 	}
+-
+-	args->first.iov_base = (void *)p;
+-	args->first.iov_len = head->iov_len - hdr;
++	rqstp->rq_vec[0].iov_base = (void*)p;
++	rqstp->rq_vec[0].iov_len = head->iov_len - hdr;
++	v = 0;
++	while (len > rqstp->rq_vec[v].iov_len) {
++		len -= rqstp->rq_vec[v].iov_len;
++		v++;
++		rqstp->rq_vec[v].iov_base = page_address(rqstp->rq_pages[v]);
++		rqstp->rq_vec[v].iov_len = PAGE_SIZE;
++	}
++	rqstp->rq_vec[v].iov_len = len;
++	args->vlen = v + 1;
+ 	return 1;
+ }
+ 
+@@ -452,24 +460,51 @@ int
+ nfs3svc_decode_symlinkargs(struct svc_rqst *rqstp, __be32 *p)
+ {
+ 	struct nfsd3_symlinkargs *args = rqstp->rq_argp;
+-	char *base = (char *)p;
+-	size_t dlen;
++	unsigned int len, avail;
++	char *old, *new;
++	struct kvec *vec;
+ 
+ 	if (!(p = decode_fh(p, &args->ffh)) ||
+-	    !(p = decode_filename(p, &args->fname, &args->flen)))
++	    !(p = decode_filename(p, &args->fname, &args->flen))
++		)
+ 		return 0;
+ 	p = decode_sattr3(p, &args->attrs);
+ 
+-	args->tlen = ntohl(*p++);
+-
+-	args->first.iov_base = p;
+-	args->first.iov_len = rqstp->rq_arg.head[0].iov_len;
+-	args->first.iov_len -= (char *)p - base;
+-
+-	dlen = args->first.iov_len + rqstp->rq_arg.page_len +
+-	       rqstp->rq_arg.tail[0].iov_len;
+-	if (dlen < XDR_QUADLEN(args->tlen) << 2)
++	/* now decode the pathname, which might be larger than the first page.
++	 * As we have to check for nul's anyway, we copy it into a new page
++	 * This page appears in the rq_res.pages list, but as pages_len is always
++	 * 0, it won't get in the way
++	 */
++	len = ntohl(*p++);
++	if (len == 0 || len > NFS3_MAXPATHLEN || len >= PAGE_SIZE)
++		return 0;
++	args->tname = new = page_address(*(rqstp->rq_next_page++));
++	args->tlen = len;
++	/* first copy and check from the first page */
++	old = (char*)p;
++	vec = &rqstp->rq_arg.head[0];
++	if ((void *)old > vec->iov_base + vec->iov_len)
+ 		return 0;
++	avail = vec->iov_len - (old - (char*)vec->iov_base);
++	while (len && avail && *old) {
++		*new++ = *old++;
++		len--;
++		avail--;
++	}
++	/* now copy next page if there is one */
++	if (len && !avail && rqstp->rq_arg.page_len) {
++		avail = min_t(unsigned int, rqstp->rq_arg.page_len, PAGE_SIZE);
++		old = page_address(rqstp->rq_arg.pages[0]);
++	}
++	while (len && avail && *old) {
++		*new++ = *old++;
++		len--;
++		avail--;
++	}
++	*new = '\0';
++	if (len)
++		return 0;
++
+ 	return 1;
+ }
+ 
+@@ -810,22 +845,19 @@ compose_entry_fh(struct nfsd3_readdirres *cd, struct svc_fh *fhp,
+ 	if (isdotent(name, namlen)) {
+ 		if (namlen == 2) {
+ 			dchild = dget_parent(dparent);
+-			/*
+-			 * Don't return filehandle for ".." if we're at
+-			 * the filesystem or export root:
+-			 */
++			/* filesystem root - cannot return filehandle for ".." */
+ 			if (dchild == dparent)
+ 				goto out;
+-			if (dparent == exp->ex_path.dentry)
+-				goto out;
+ 		} else
+ 			dchild = dget(dparent);
+ 	} else
+-		dchild = lookup_positive_unlocked(name, dparent, namlen);
++		dchild = lookup_one_len_unlocked(name, dparent, namlen);
+ 	if (IS_ERR(dchild))
+ 		return rv;
+ 	if (d_mountpoint(dchild))
+ 		goto out;
++	if (d_really_is_negative(dchild))
++		goto out;
+ 	if (dchild->d_inode->i_ino != ino)
+ 		goto out;
+ 	rv = fh_compose(fhp, exp, dchild, &cd->fh);
+diff --git a/bundle/fs/nfsd/nfs4layouts.c b/bundle/fs/nfsd/nfs4layouts.c
+index 68769844e..e122da696 100644
+--- a/bundle/fs/nfsd/nfs4layouts.c
++++ b/bundle/fs/nfsd/nfs4layouts.c
+@@ -682,7 +682,7 @@ nfsd4_cb_layout_done(struct nfsd4_callback *cb, struct rpc_task *task)
+ 
+ 		/* Client gets 2 lease periods to return it */
+ 		cutoff = ktime_add_ns(task->tk_start,
+-					 (u64)nn->nfsd4_lease * NSEC_PER_SEC * 2);
++					 nn->nfsd4_lease * NSEC_PER_SEC * 2);
+ 
+ 		if (ktime_before(now, cutoff)) {
+ 			rpc_delay(task, HZ/100); /* 10 mili-seconds */
+diff --git a/bundle/fs/nfsd/nfs4proc.c b/bundle/fs/nfsd/nfs4proc.c
+index 075d925e1..f85cd2f95 100644
+--- a/bundle/fs/nfsd/nfs4proc.c
++++ b/bundle/fs/nfsd/nfs4proc.c
+@@ -948,6 +948,24 @@ out:
+ 	return status;
+ }
+ 
++static int fill_in_write_vector(struct kvec *vec, struct nfsd4_write *write)
++{
++        int i = 1;
++        int buflen = write->wr_buflen;
++
++        vec[0].iov_base = write->wr_head.iov_base;
++        vec[0].iov_len = min_t(int, buflen, write->wr_head.iov_len);
++        buflen -= vec[0].iov_len;
++
++        while (buflen) {
++                vec[i].iov_base = page_address(write->wr_pagelist[i - 1]);
++                vec[i].iov_len = min_t(int, PAGE_SIZE, buflen);
++                buflen -= vec[i].iov_len;
++                i++;
++        }
++        return i;
++}
++
+ static __be32
+ nfsd4_write(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+ 	    struct nfsd4_write *write)
+@@ -972,10 +990,7 @@ nfsd4_write(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+ 	write->wr_how_written = write->wr_stable_how;
+ 	gen_boot_verifier(&write->wr_verifier, SVC_NET(rqstp));
+ 
+-	nvecs = svc_fill_write_vector(rqstp, write->wr_pagelist,
+-				      &write->wr_head, write->wr_buflen);
+-	if (!nvecs)
+-		return nfserr_io;
++	nvecs = fill_in_write_vector(rqstp->rq_vec, write);
+ 	WARN_ON_ONCE(nvecs > ARRAY_SIZE(rqstp->rq_vec));
+ 
+ 	status = nfsd_vfs_write(rqstp, &cstate->current_fh, filp,
+@@ -1041,8 +1056,7 @@ nfsd4_clone(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+ 		goto out;
+ 
+ 	status = nfsd4_clone_file_range(src, clone->cl_src_pos,
+-			dst, clone->cl_dst_pos, clone->cl_count,
+-			EX_ISSYNC(cstate->current_fh.fh_export));
++			dst, clone->cl_dst_pos, clone->cl_count);
+ 
+ 	fput(dst);
+ 	fput(src);
+diff --git a/bundle/fs/nfsd/nfs4state.c b/bundle/fs/nfsd/nfs4state.c
+index 7e6fd1073..6e180803c 100644
+--- a/bundle/fs/nfsd/nfs4state.c
++++ b/bundle/fs/nfsd/nfs4state.c
+@@ -246,8 +246,6 @@ find_or_allocate_block(struct nfs4_lockowner *lo, struct knfsd_fh *fh,
+ 	if (!nbl) {
+ 		nbl= kmalloc(sizeof(*nbl), GFP_KERNEL);
+ 		if (nbl) {
+-			INIT_LIST_HEAD(&nbl->nbl_list);
+-			INIT_LIST_HEAD(&nbl->nbl_lru);
+ 			fh_copy_shallow(&nbl->nbl_fh, fh);
+ 			locks_init_lock(&nbl->nbl_lock);
+ 			nfsd4_init_cb(&nbl->nbl_cb, lo->lo_owner.so_client,
+@@ -3074,17 +3072,12 @@ static bool replay_matches_cache(struct svc_rqst *rqstp,
+ 	    (bool)seq->cachethis)
+ 		return false;
+ 	/*
+-	 * If there's an error then the reply can have fewer ops than
+-	 * the call.
++	 * If there's an error than the reply can have fewer ops than
++	 * the call.  But if we cached a reply with *more* ops than the
++	 * call you're sending us now, then this new call is clearly not
++	 * really a replay of the old one:
+ 	 */
+-	if (slot->sl_opcnt < argp->opcnt && !slot->sl_status)
+-		return false;
+-	/*
+-	 * But if we cached a reply with *more* ops than the call you're
+-	 * sending us now, then this new call is clearly not really a
+-	 * replay of the old one:
+-	 */
+-	if (slot->sl_opcnt > argp->opcnt)
++	if (slot->sl_opcnt < argp->opcnt)
+ 		return false;
+ 	/* This is the only check explicitly called by spec: */
+ 	if (!same_creds(&rqstp->rq_cred, &slot->sl_cred))
+@@ -6041,7 +6034,7 @@ nfsd4_lock(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+ 	}
+ 
+ 	if (fl_flags & FL_SLEEP) {
+-		nbl->nbl_time = get_seconds();
++		nbl->nbl_time = jiffies;
+ 		spin_lock(&nn->blocked_locks_lock);
+ 		list_add_tail(&nbl->nbl_list, &lock_sop->lo_blocked);
+ 		list_add_tail(&nbl->nbl_lru, &nn->blocked_locks_lru);
+diff --git a/bundle/fs/nfsd/nfs4xdr.c b/bundle/fs/nfsd/nfs4xdr.c
+index 69171430a..666c03ac8 100644
+--- a/bundle/fs/nfsd/nfs4xdr.c
++++ b/bundle/fs/nfsd/nfs4xdr.c
+@@ -2923,9 +2923,18 @@ nfsd4_encode_dirent_fattr(struct xdr_stream *xdr, struct nfsd4_readdir *cd,
+ 	__be32 nfserr;
+ 	int ignore_crossmnt = 0;
+ 
+-	dentry = lookup_positive_unlocked(name, cd->rd_fhp->fh_dentry, namlen);
++	dentry = lookup_one_len_unlocked(name, cd->rd_fhp->fh_dentry, namlen);
+ 	if (IS_ERR(dentry))
+ 		return nfserrno(PTR_ERR(dentry));
++	if (d_really_is_negative(dentry)) {
++		/*
++		 * we're not holding the i_mutex here, so there's
++		 * a window where this directory entry could have gone
++		 * away.
++		 */
++		dput(dentry);
++		return nfserr_noent;
++	}
+ 
+ 	exp_get(exp);
+ 	/*
+diff --git a/bundle/fs/nfsd/nfsproc.c b/bundle/fs/nfsd/nfsproc.c
+index f024d47c9..44b157553 100644
+--- a/bundle/fs/nfsd/nfsproc.c
++++ b/bundle/fs/nfsd/nfsproc.c
+@@ -117,13 +117,6 @@ done:
+ 	return nfsd_return_attrs(nfserr, resp);
+ }
+ 
+-/* Obsolete, replaced by MNTPROC_MNT. */
+-static __be32
+-nfsd_proc_root(struct svc_rqst *rqstp)
+-{
+-	return nfs_ok;
+-}
+-
+ /*
+  * Look up a path name component
+  * Note: the dentry in the resp->fh may be negative if the file
+@@ -207,13 +200,6 @@ nfsd_proc_read(struct svc_rqst *rqstp)
+ 	return fh_getattr(&resp->fh, &resp->stat);
+ }
+ 
+-/* Reserved */
+-static __be32
+-nfsd_proc_writecache(struct svc_rqst *rqstp)
+-{
+-	return nfs_ok;
+-}
+-
+ /*
+  * Write data to a file
+  * N.B. After this call resp->fh needs an fh_put
+@@ -225,19 +211,13 @@ nfsd_proc_write(struct svc_rqst *rqstp)
+ 	struct nfsd_attrstat *resp = rqstp->rq_resp;
+ 	__be32	nfserr;
+ 	unsigned long cnt = argp->len;
+-	unsigned int nvecs;
+ 
+ 	dprintk("nfsd: WRITE    %s %d bytes at %d\n",
+ 		SVCFH_fmt(&argp->fh),
+ 		argp->len, argp->offset);
+ 
+-	nvecs = svc_fill_write_vector(rqstp, rqstp->rq_arg.pages,
+-				      &argp->first, cnt);
+-	if (!nvecs)
+-		return nfserr_io;
+-	nfserr = nfsd_write(rqstp, fh_copy(&resp->fh, &argp->fh),
+-			    argp->offset, rqstp->rq_vec, nvecs,
+-			    &cnt, NFS_DATA_SYNC);
++	nfserr = nfsd_write(rqstp, fh_copy(&resp->fh, &argp->fh), argp->offset,
++				rqstp->rq_vec, argp->vlen, &cnt, NFS_DATA_SYNC);
+ 	return nfsd_return_attrs(nfserr, resp);
+ }
+ 
+@@ -463,24 +443,20 @@ nfsd_proc_symlink(struct svc_rqst *rqstp)
+ 	struct svc_fh	newfh;
+ 	__be32		nfserr;
+ 
+-	if (argp->tlen > NFS_MAXPATHLEN)
+-		return nfserr_nametoolong;
+-
+-	argp->tname = svc_fill_symlink_pathname(rqstp, &argp->first,
+-						page_address(rqstp->rq_arg.pages[0]),
+-						argp->tlen);
+-	if (IS_ERR(argp->tname))
+-		return nfserrno(PTR_ERR(argp->tname));
+-
+ 	dprintk("nfsd: SYMLINK  %s %.*s -> %.*s\n",
+ 		SVCFH_fmt(&argp->ffh), argp->flen, argp->fname,
+ 		argp->tlen, argp->tname);
+ 
+ 	fh_init(&newfh, NFS_FHSIZE);
++	/*
++	 * Crazy hack: the request fits in a page, and already-decoded
++	 * attributes follow argp->tname, so it's safe to just write a
++	 * null to ensure it's null-terminated:
++	 */
++	argp->tname[argp->tlen] = '\0';
+ 	nfserr = nfsd_symlink(rqstp, &argp->ffh, argp->fname, argp->flen,
+ 						 argp->tname, &newfh);
+ 
+-	kfree(argp->tname);
+ 	fh_put(&argp->ffh);
+ 	fh_put(&newfh);
+ 	return nfserr;
+@@ -628,7 +604,6 @@ static struct svc_procedure		nfsd_procedures2[18] = {
+ 		.pc_xdrressize = ST+AT,
+ 	},
+ 	[NFSPROC_ROOT] = {
+-		.pc_func = nfsd_proc_root,
+ 		.pc_decode = nfssvc_decode_void,
+ 		.pc_encode = nfssvc_encode_void,
+ 		.pc_argsize = sizeof(struct nfsd_void),
+@@ -666,7 +641,6 @@ static struct svc_procedure		nfsd_procedures2[18] = {
+ 		.pc_xdrressize = ST+AT+1+NFSSVC_MAXBLKSIZE_V2/4,
+ 	},
+ 	[NFSPROC_WRITECACHE] = {
+-		.pc_func = nfsd_proc_writecache,
+ 		.pc_decode = nfssvc_decode_void,
+ 		.pc_encode = nfssvc_encode_void,
+ 		.pc_argsize = sizeof(struct nfsd_void),
+diff --git a/bundle/fs/nfsd/nfssvc.c b/bundle/fs/nfsd/nfssvc.c
+index a8c861db0..c484c3447 100644
+--- a/bundle/fs/nfsd/nfssvc.c
++++ b/bundle/fs/nfsd/nfssvc.c
+@@ -412,7 +412,8 @@ static void nfsd_last_thread(struct svc_serv *serv, struct net *net)
+ 		return;
+ 
+ 	nfsd_shutdown_net(net);
+-	pr_info("nfsd: last server has exited, flushing export cache\n");
++	printk(KERN_WARNING "nfsd: last server has exited, flushing export "
++			    "cache\n");
+ 	nfsd_export_flush(net);
+ }
+ 
+diff --git a/bundle/fs/nfsd/nfsxdr.c b/bundle/fs/nfsd/nfsxdr.c
+index 314344dbc..e4da27179 100644
+--- a/bundle/fs/nfsd/nfsxdr.c
++++ b/bundle/fs/nfsd/nfsxdr.c
+@@ -69,6 +69,22 @@ decode_filename(__be32 *p, char **namp, unsigned int *lenp)
+ 	return p;
+ }
+ 
++static __be32 *
++decode_pathname(__be32 *p, char **namp, unsigned int *lenp)
++{
++	char		*name;
++	unsigned int	i;
++
++	if ((p = xdr_decode_string_inplace(p, namp, lenp, NFS_MAXPATHLEN)) != NULL) {
++		for (i = 0, name = *namp; i < *lenp; i++, name++) {
++			if (*name == '\0')
++				return NULL;
++		}
++	}
++
++	return p;
++}
++
+ static __be32 *
+ decode_sattr(__be32 *p, struct iattr *iap)
+ {
+@@ -269,6 +285,7 @@ nfssvc_decode_writeargs(struct svc_rqst *rqstp, __be32 *p)
+ 	struct nfsd_writeargs *args = rqstp->rq_argp;
+ 	unsigned int len, hdr, dlen;
+ 	struct kvec *head = rqstp->rq_arg.head;
++	int v;
+ 
+ 	p = decode_fh(p, &args->fh);
+ 	if (!p)
+@@ -304,8 +321,17 @@ nfssvc_decode_writeargs(struct svc_rqst *rqstp, __be32 *p)
+ 	if (dlen < XDR_QUADLEN(len)*4)
+ 		return 0;
+ 
+-	args->first.iov_base = (void *)p;
+-	args->first.iov_len = head->iov_len - hdr;
++	rqstp->rq_vec[0].iov_base = (void*)p;
++	rqstp->rq_vec[0].iov_len = head->iov_len - hdr;
++	v = 0;
++	while (len > rqstp->rq_vec[v].iov_len) {
++		len -= rqstp->rq_vec[v].iov_len;
++		v++;
++		rqstp->rq_vec[v].iov_base = page_address(rqstp->rq_pages[v]);
++		rqstp->rq_vec[v].iov_len = PAGE_SIZE;
++	}
++	rqstp->rq_vec[v].iov_len = len;
++	args->vlen = v + 1;
+ 	return 1;
+ }
+ 
+@@ -365,40 +391,15 @@ nfssvc_decode_linkargs(struct svc_rqst *rqstp, __be32 *p)
+ int
+ nfssvc_decode_symlinkargs(struct svc_rqst *rqstp, __be32 *p)
+ {
+-	char *base = (char *)p;
+-	size_t xdrlen;
+ 	struct nfsd_symlinkargs *args = rqstp->rq_argp;
+ 
+ 	if (   !(p = decode_fh(p, &args->ffh))
+-	    || !(p = decode_filename(p, &args->fname, &args->flen)))
++	    || !(p = decode_filename(p, &args->fname, &args->flen))
++	    || !(p = decode_pathname(p, &args->tname, &args->tlen)))
+ 		return 0;
++	p = decode_sattr(p, &args->attrs);
+ 
+-	args->tlen = ntohl(*p++);
+-	if (args->tlen == 0)
+-		return 0;
+-
+-	args->first.iov_base = p;
+-	args->first.iov_len = rqstp->rq_arg.head[0].iov_len;
+-	args->first.iov_len -= (char *)p - base;
+-
+-	/* This request is never larger than a page. Therefore,
+-	 * transport will deliver either:
+-	 * 1. pathname in the pagelist -> sattr is in the tail.
+-	 * 2. everything in the head buffer -> sattr is in the head.
+-	 */
+-	if (rqstp->rq_arg.page_len) {
+-		if (args->tlen != rqstp->rq_arg.page_len)
+-			return 0;
+-		p = rqstp->rq_arg.tail[0].iov_base;
+-	} else {
+-		xdrlen = XDR_QUADLEN(args->tlen);
+-		if (xdrlen > args->first.iov_len - (8 * sizeof(__be32)))
+-			return 0;
+-		p += xdrlen;
+-	}
+-	decode_sattr(p, &args->attrs);
+-
+-	return 1;
++	return xdr_argsize_check(rqstp, p);
+ }
+ 
+ int
+diff --git a/bundle/fs/nfsd/state.h b/bundle/fs/nfsd/state.h
+index fb5c84e5e..3b6f6fb64 100644
+--- a/bundle/fs/nfsd/state.h
++++ b/bundle/fs/nfsd/state.h
+@@ -591,7 +591,7 @@ static inline bool nfsd4_stateid_generation_after(stateid_t *a, stateid_t *b)
+ struct nfsd4_blocked_lock {
+ 	struct list_head	nbl_list;
+ 	struct list_head	nbl_lru;
+-	time_t			nbl_time;
++	unsigned long		nbl_time;
+ 	struct file_lock	nbl_lock;
+ 	struct knfsd_fh		nbl_fh;
+ 	struct nfsd4_callback	nbl_cb;
+diff --git a/bundle/fs/nfsd/vfs.c b/bundle/fs/nfsd/vfs.c
+index 234d7537a..e10575e1f 100644
+--- a/bundle/fs/nfsd/vfs.c
++++ b/bundle/fs/nfsd/vfs.c
+@@ -538,19 +538,10 @@ __be32 nfsd4_set_nfs4_label(struct svc_rqst *rqstp, struct svc_fh *fhp,
+ #endif
+ 
+ __be32 nfsd4_clone_file_range(struct file *src, u64 src_pos, struct file *dst,
+-		u64 dst_pos, u64 count, bool sync)
++		u64 dst_pos, u64 count)
+ {
+-	int ret = vfs_clone_file_range(src, src_pos, dst, dst_pos,
+-				       count);
+-	if (ret)
+-		return nfserrno(ret);
+-	if (sync) {
+-		loff_t dst_end = count ? dst_pos + count - 1 : LLONG_MAX;
+-		int status = vfs_fsync_range(dst, dst_pos, dst_end, 0);
+-		if (status < 0)
+-			return nfserrno(status);
+-	}
+-	return 0;
++	return nfserrno(vfs_clone_file_range(src, src_pos, dst, dst_pos,
++					     count));
+ }
+ 
+ ssize_t nfsd_copy_file_range(struct file *src, u64 src_pos, struct file *dst,
+@@ -994,13 +985,12 @@ nfsd_vfs_write(struct svc_rqst *rqstp, struct svc_fh *fhp, struct file *file,
+ 
+ 	if (test_bit(RQ_LOCAL, &rqstp->rq_flags))
+ 		/*
+-		 * We want throttling in balance_dirty_pages()
+-		 * and shrink_inactive_list() to only consider
+-		 * the backingdev we are writing to, so that nfs to
++		 * We want less throttling in balance_dirty_pages()
++		 * and shrink_inactive_list() so that nfs to
+ 		 * localhost doesn't cause nfsd to lock up due to all
+ 		 * the client's dirty pages or its congested queue.
+ 		 */
+-		current->flags |= PF_LOCAL_THROTTLE;
++		current->flags |= PF_LESS_THROTTLE;
+ 
+ 	exp = fhp->fh_export;
+ 	use_wgather = (rqstp->rq_vers == 2) && EX_WGATHER(exp);
+@@ -1031,7 +1021,7 @@ out_nfserr:
+ 	else
+ 		err = nfserrno(host_err);
+ 	if (test_bit(RQ_LOCAL, &rqstp->rq_flags))
+-		current_restore_flags(pflags, PF_LOCAL_THROTTLE);
++		current_restore_flags(pflags, PF_LESS_THROTTLE);
+ 	return err;
+ }
+ 
+@@ -1206,9 +1196,6 @@ nfsd_create_locked(struct svc_rqst *rqstp, struct svc_fh *fhp,
+ 		iap->ia_mode = 0;
+ 	iap->ia_mode = (iap->ia_mode & S_IALLUGO) | type;
+ 
+-	if (!IS_POSIXACL(dirp))
+-		iap->ia_mode &= ~current_umask();
+-
+ 	err = 0;
+ 	host_err = 0;
+ 	switch (type) {
+@@ -1420,9 +1407,6 @@ do_nfsd_create(struct svc_rqst *rqstp, struct svc_fh *fhp,
+ 		goto out;
+ 	}
+ 
+-	if (!IS_POSIXACL(dirp))
+-		iap->ia_mode &= ~current_umask();
+-
+ 	host_err = vfs_create(dirp, dchild, iap->ia_mode, true);
+ 	if (host_err < 0) {
+ 		fh_drop_write(fhp);
+diff --git a/bundle/fs/nfsd/vfs.h b/bundle/fs/nfsd/vfs.h
+index 5d631a051..1bbdccecb 100644
+--- a/bundle/fs/nfsd/vfs.h
++++ b/bundle/fs/nfsd/vfs.h
+@@ -57,7 +57,7 @@ __be32          nfsd4_set_nfs4_label(struct svc_rqst *, struct svc_fh *,
+ __be32		nfsd4_vfs_fallocate(struct svc_rqst *, struct svc_fh *,
+ 				    struct file *, loff_t, loff_t, int);
+ __be32		nfsd4_clone_file_range(struct file *, u64, struct file *,
+-				       u64, u64, bool);
++			u64, u64);
+ #endif /* CONFIG_NFSD_V4 */
+ __be32		nfsd_create_locked(struct svc_rqst *, struct svc_fh *,
+ 				char *name, int len, struct iattr *attrs,
+diff --git a/bundle/fs/nfsd/xdr.h b/bundle/fs/nfsd/xdr.h
+index a641ca6de..457ce45e5 100644
+--- a/bundle/fs/nfsd/xdr.h
++++ b/bundle/fs/nfsd/xdr.h
+@@ -33,7 +33,7 @@ struct nfsd_writeargs {
+ 	svc_fh			fh;
+ 	__u32			offset;
+ 	int			len;
+-	struct kvec		first;
++	int			vlen;
+ };
+ 
+ struct nfsd_createargs {
+@@ -71,7 +71,6 @@ struct nfsd_symlinkargs {
+ 	char *			tname;
+ 	unsigned int		tlen;
+ 	struct iattr		attrs;
+-	struct kvec		first;
+ };
+ 
+ struct nfsd_readdirargs {
+diff --git a/bundle/fs/nfsd/xdr3.h b/bundle/fs/nfsd/xdr3.h
+index 696bc5255..80d7da620 100644
+--- a/bundle/fs/nfsd/xdr3.h
++++ b/bundle/fs/nfsd/xdr3.h
+@@ -40,7 +40,7 @@ struct nfsd3_writeargs {
+ 	__u32			count;
+ 	int			stable;
+ 	__u32			len;
+-	struct kvec		first;
++	int			vlen;
+ };
+ 
+ struct nfsd3_createargs {
+@@ -89,7 +89,6 @@ struct nfsd3_symlinkargs {
+ 	char *			tname;
+ 	unsigned int		tlen;
+ 	struct iattr		attrs;
+-	struct kvec		first;
+ };
+ 
+ struct nfsd3_readdirargs {
+diff --git a/bundle/fs/nfsd/xdr4.h b/bundle/fs/nfsd/xdr4.h
+index 42234750c..fc4eb0a13 100644
+--- a/bundle/fs/nfsd/xdr4.h
++++ b/bundle/fs/nfsd/xdr4.h
+@@ -110,7 +110,6 @@ struct nfsd4_create {
+ 		struct {
+ 			u32 datalen;
+ 			char *data;
+-			struct kvec first;
+ 		} link;   /* NF4LNK */
+ 		struct {
+ 			u32 specdata1;
+@@ -126,7 +125,6 @@ struct nfsd4_create {
+ };
+ #define cr_datalen	u.link.datalen
+ #define cr_data		u.link.data
+-#define cr_first	u.link.first
+ #define cr_specdata1	u.dev.specdata1
+ #define cr_specdata2	u.dev.specdata2
+ 
+diff --git a/bundle/include/linux/nfs_fs_sb.h b/bundle/include/linux/nfs_fs_sb.h
+index 22a1c7a71..f61952d67 100644
+--- a/bundle/include/linux/nfs_fs_sb.h
++++ b/bundle/include/linux/nfs_fs_sb.h
+@@ -42,7 +42,6 @@ struct nfs_client {
+ #define NFS_CS_MIGRATION	2		/* - transparent state migr */
+ #define NFS_CS_INFINITE_SLOTS	3		/* - don't limit TCP slots */
+ #define NFS_CS_NO_RETRANS_TIMEOUT	4	/* - Disable retransmit timeouts */
+-#define NFS_CS_NO_SHARE		5		/* - don't share across mounts */
+ 	struct sockaddr_storage	cl_addr;	/* server identifier */
+ 	size_t			cl_addrlen;
+ 	struct rpc_portgroup *  cl_localports;
+@@ -65,7 +64,6 @@ struct nfs_client {
+ 	unsigned int		cl_nconnect;	/* Number of connections */
+ 	const char *		cl_principal;  /* used for machine cred */
+ 
+-	unsigned int		cl_xprt_id;
+ #if IS_ENABLED(CONFIG_NFS_V4)
+ 	struct list_head	cl_ds_clients; /* auth flavor data servers */
+ 	u64			cl_clientid;	/* constant */
+diff --git a/bundle/include/linux/nfs_page.h b/bundle/include/linux/nfs_page.h
+index c99725c68..88065f040 100644
+--- a/bundle/include/linux/nfs_page.h
++++ b/bundle/include/linux/nfs_page.h
+@@ -93,7 +93,6 @@ struct nfs_pageio_descriptor {
+ 	const struct rpc_call_ops *pg_rpc_callops;
+ 	const struct nfs_pgio_completion_ops *pg_completion_ops;
+ 	struct pnfs_layout_segment *pg_lseg;
+-	struct nfs_io_completion *pg_io_completion;
+ 	struct nfs_direct_req	*pg_dreq;
+ 	void			*pg_layout_private;
+ 	unsigned int		pg_bsize;	/* default bsize for mirrors */
+@@ -105,6 +104,17 @@ struct nfs_pageio_descriptor {
+ 	u32			pg_mirror_idx;	/* current mirror */
+ };
+ 
++static inline struct nfs_io_completion **pg_io_completion(struct nfs_pageio_descriptor *desc)
++{
++	static struct nfs_io_completion *failsafe = NULL;
++	if (desc->pg_mirrors == desc->pg_mirrors_static)
++		return (struct nfs_io_completion **)&desc->pg_mirrors_dynamic;
++	if (desc->pg_mirrors == desc->pg_mirrors_dynamic)
++		return (struct nfs_io_completion **)&desc->pg_mirrors_static[0].pg_list.next;
++	WARN_ON_ONCE(1);
++	return &failsafe;
++}
++
+ /* arbitrarily selected limit to number of mirrors */
+ #define NFS_PAGEIO_DESCRIPTOR_MIRROR_MAX 16
+ 
+diff --git a/bundle/include/linux/nfs_xdr.h b/bundle/include/linux/nfs_xdr.h
+index 9a65c6998..056f04c46 100644
+--- a/bundle/include/linux/nfs_xdr.h
++++ b/bundle/include/linux/nfs_xdr.h
+@@ -1245,13 +1245,11 @@ struct nfs41_impl_id {
+ 	struct nfstime4			date;
+ };
+ 
+-#define MAX_BIND_CONN_TO_SESSION_RETRIES 3
+ struct nfs41_bind_conn_to_session_args {
+ 	struct nfs_client		*client;
+ 	struct nfs4_sessionid		sessionid;
+ 	u32				dir;
+ 	bool				use_conn_in_rdma_mode;
+-	int				retries;
+ };
+ 
+ struct nfs41_bind_conn_to_session_res {
+@@ -1439,7 +1437,6 @@ struct nfs_pgio_header {
+ 	void (*release) (struct nfs_pgio_header *hdr);
+ 	const struct nfs_pgio_completion_ops *completion_ops;
+ 	const struct nfs_rw_ops	*rw_ops;
+-	struct nfs_io_completion *io_completion;
+ 	struct nfs_direct_req	*dreq;
+ 	void			*layout_private;
+ 	spinlock_t		lock;
+@@ -1463,6 +1460,9 @@ struct nfs_pgio_header {
+ 	struct nfs_client	*ds_clp;	/* pNFS data server */
+ 	int			ds_commit_idx;	/* ds index if ds_clp is set */
+ 	int			pgio_mirror_idx;/* mirror index in pgio layer */
++#ifndef __GENKSYMS__
++	struct nfs_io_completion *io_completion;
++#endif
+ };
+ 
+ struct nfs_mds_commit_info {
+diff --git a/bundle/net/sunrpc/auth_generic.c b/bundle/net/sunrpc/auth_generic.c
+deleted file mode 100644
+index 370efaad3..000000000
+--- a/bundle/net/sunrpc/auth_generic.c
++++ /dev/null
+@@ -1,310 +0,0 @@
+-/*
+- * Generic RPC credential
+- *
+- * Copyright (C) 2008, Trond Myklebust <Trond.Myklebust@netapp.com>
+- */
+-
+-#include <linux/err.h>
+-#include <linux/slab.h>
+-#include <linux/types.h>
+-#include <linux/module.h>
+-#include <linux/sched.h>
+-#include <linux/sunrpc/auth.h>
+-#include <linux/sunrpc/clnt.h>
+-#include <linux/sunrpc/debug.h>
+-#include <linux/sunrpc/sched.h>
+-
+-#if IS_ENABLED(CONFIG_SUNRPC_DEBUG)
+-# define RPCDBG_FACILITY	RPCDBG_AUTH
+-#endif
+-
+-#define RPC_MACHINE_CRED_USERID		GLOBAL_ROOT_UID
+-#define RPC_MACHINE_CRED_GROUPID	GLOBAL_ROOT_GID
+-
+-struct generic_cred {
+-	struct rpc_cred gc_base;
+-	struct auth_cred acred;
+-};
+-
+-static struct rpc_auth generic_auth;
+-static const struct rpc_credops generic_credops;
+-
+-/*
+- * Public call interface
+- */
+-struct rpc_cred *rpc_lookup_cred(void)
+-{
+-	return rpcauth_lookupcred(&generic_auth, 0);
+-}
+-EXPORT_SYMBOL_GPL(rpc_lookup_cred);
+-
+-struct rpc_cred *
+-rpc_lookup_generic_cred(struct auth_cred *acred, int flags, gfp_t gfp)
+-{
+-	return rpcauth_lookup_credcache(&generic_auth, acred, flags, gfp);
+-}
+-EXPORT_SYMBOL_GPL(rpc_lookup_generic_cred);
+-
+-struct rpc_cred *rpc_lookup_cred_nonblock(void)
+-{
+-	return rpcauth_lookupcred(&generic_auth, RPCAUTH_LOOKUP_RCU);
+-}
+-EXPORT_SYMBOL_GPL(rpc_lookup_cred_nonblock);
+-
+-/*
+- * Public call interface for looking up machine creds.
+- */
+-struct rpc_cred *rpc_lookup_machine_cred(const char *service_name)
+-{
+-	struct auth_cred acred = {
+-		.uid = RPC_MACHINE_CRED_USERID,
+-		.gid = RPC_MACHINE_CRED_GROUPID,
+-		.principal = service_name,
+-		.machine_cred = 1,
+-	};
+-
+-	dprintk("RPC:       looking up machine cred for service %s\n",
+-			service_name);
+-	return generic_auth.au_ops->lookup_cred(&generic_auth, &acred, 0);
+-}
+-EXPORT_SYMBOL_GPL(rpc_lookup_machine_cred);
+-
+-static struct rpc_cred *generic_bind_cred(struct rpc_task *task,
+-		struct rpc_cred *cred, int lookupflags)
+-{
+-	struct rpc_auth *auth = task->tk_client->cl_auth;
+-	struct auth_cred *acred = &container_of(cred, struct generic_cred, gc_base)->acred;
+-
+-	return auth->au_ops->lookup_cred(auth, acred, lookupflags);
+-}
+-
+-static int
+-generic_hash_cred(struct auth_cred *acred, unsigned int hashbits)
+-{
+-	u32 uid = from_kuid(&init_user_ns, acred->uid);
+-	u32 gid;
+-	int ret = hash_32(uid, 32);
+-
+-	if (acred->group_info) {
+-		int g;
+-
+-		for (g = 0; g < acred->group_info->ngroups; g++) {
+-			gid = from_kgid(&init_user_ns, acred->group_info->gid[g]);
+-			ret = hash_32(ret ^ gid, 32);
+-		}
+-	}
+-	gid = from_kgid(&init_user_ns, acred->gid);
+-	return hash_32(ret ^ gid, hashbits);
+-}
+-
+-/*
+- * Lookup generic creds for current process
+- */
+-static struct rpc_cred *
+-generic_lookup_cred(struct rpc_auth *auth, struct auth_cred *acred, int flags)
+-{
+-	return rpcauth_lookup_credcache(&generic_auth, acred, flags, GFP_KERNEL);
+-}
+-
+-static struct rpc_cred *
+-generic_create_cred(struct rpc_auth *auth, struct auth_cred *acred, int flags, gfp_t gfp)
+-{
+-	struct generic_cred *gcred;
+-
+-	gcred = kmalloc(sizeof(*gcred), gfp);
+-	if (gcred == NULL)
+-		return ERR_PTR(-ENOMEM);
+-
+-	rpcauth_init_cred(&gcred->gc_base, acred, &generic_auth, &generic_credops);
+-	gcred->gc_base.cr_flags = 1UL << RPCAUTH_CRED_UPTODATE;
+-
+-	gcred->acred.uid = acred->uid;
+-	gcred->acred.gid = acred->gid;
+-	gcred->acred.group_info = acred->group_info;
+-	gcred->acred.ac_flags = 0;
+-	if (gcred->acred.group_info != NULL)
+-		get_group_info(gcred->acred.group_info);
+-	gcred->acred.machine_cred = acred->machine_cred;
+-	gcred->acred.principal = acred->principal;
+-
+-	dprintk("RPC:       allocated %s cred %p for uid %d gid %d\n",
+-			gcred->acred.machine_cred ? "machine" : "generic",
+-			gcred,
+-			from_kuid(&init_user_ns, acred->uid),
+-			from_kgid(&init_user_ns, acred->gid));
+-	return &gcred->gc_base;
+-}
+-
+-static void
+-generic_free_cred(struct rpc_cred *cred)
+-{
+-	struct generic_cred *gcred = container_of(cred, struct generic_cred, gc_base);
+-
+-	dprintk("RPC:       generic_free_cred %p\n", gcred);
+-	if (gcred->acred.group_info != NULL)
+-		put_group_info(gcred->acred.group_info);
+-	kfree(gcred);
+-}
+-
+-static void
+-generic_free_cred_callback(struct rcu_head *head)
+-{
+-	struct rpc_cred *cred = container_of(head, struct rpc_cred, cr_rcu);
+-	generic_free_cred(cred);
+-}
+-
+-static void
+-generic_destroy_cred(struct rpc_cred *cred)
+-{
+-	call_rcu(&cred->cr_rcu, generic_free_cred_callback);
+-}
+-
+-static int
+-machine_cred_match(struct auth_cred *acred, struct generic_cred *gcred, int flags)
+-{
+-	if (!gcred->acred.machine_cred ||
+-	    gcred->acred.principal != acred->principal ||
+-	    !uid_eq(gcred->acred.uid, acred->uid) ||
+-	    !gid_eq(gcred->acred.gid, acred->gid))
+-		return 0;
+-	return 1;
+-}
+-
+-/*
+- * Match credentials against current process creds.
+- */
+-static int
+-generic_match(struct auth_cred *acred, struct rpc_cred *cred, int flags)
+-{
+-	struct generic_cred *gcred = container_of(cred, struct generic_cred, gc_base);
+-	int i;
+-
+-	if (acred->machine_cred)
+-		return machine_cred_match(acred, gcred, flags);
+-
+-	if (!uid_eq(gcred->acred.uid, acred->uid) ||
+-	    !gid_eq(gcred->acred.gid, acred->gid) ||
+-	    gcred->acred.machine_cred != 0)
+-		goto out_nomatch;
+-
+-	/* Optimisation in the case where pointers are identical... */
+-	if (gcred->acred.group_info == acred->group_info)
+-		goto out_match;
+-
+-	/* Slow path... */
+-	if (gcred->acred.group_info->ngroups != acred->group_info->ngroups)
+-		goto out_nomatch;
+-	for (i = 0; i < gcred->acred.group_info->ngroups; i++) {
+-		if (!gid_eq(gcred->acred.group_info->gid[i],
+-				acred->group_info->gid[i]))
+-			goto out_nomatch;
+-	}
+-out_match:
+-	return 1;
+-out_nomatch:
+-	return 0;
+-}
+-
+-int __init rpc_init_generic_auth(void)
+-{
+-	return rpcauth_init_credcache(&generic_auth);
+-}
+-
+-void rpc_destroy_generic_auth(void)
+-{
+-	rpcauth_destroy_credcache(&generic_auth);
+-}
+-
+-/*
+- * Test the the current time (now) against the underlying credential key expiry
+- * minus a timeout and setup notification.
+- *
+- * The normal case:
+- * If 'now' is before the key expiry minus RPC_KEY_EXPIRE_TIMEO, set
+- * the RPC_CRED_NOTIFY_TIMEOUT flag to setup the underlying credential
+- * rpc_credops crmatch routine to notify this generic cred when it's key
+- * expiration is within RPC_KEY_EXPIRE_TIMEO, and return 0.
+- *
+- * The error case:
+- * If the underlying cred lookup fails, return -EACCES.
+- *
+- * The 'almost' error case:
+- * If 'now' is within key expiry minus RPC_KEY_EXPIRE_TIMEO, but not within
+- * key expiry minus RPC_KEY_EXPIRE_FAIL, set the RPC_CRED_EXPIRE_SOON bit
+- * on the acred ac_flags and return 0.
+- */
+-static int
+-generic_key_timeout(struct rpc_auth *auth, struct rpc_cred *cred)
+-{
+-	struct auth_cred *acred = &container_of(cred, struct generic_cred,
+-						gc_base)->acred;
+-	struct rpc_cred *tcred;
+-	int ret = 0;
+-
+-
+-	/* Fast track for non crkey_timeout (no key) underlying credentials */
+-	if (auth->au_flags & RPCAUTH_AUTH_NO_CRKEY_TIMEOUT)
+-		return 0;
+-
+-	/* Fast track for the normal case */
+-	if (test_bit(RPC_CRED_NOTIFY_TIMEOUT, &acred->ac_flags))
+-		return 0;
+-
+-	/* lookup_cred either returns a valid referenced rpc_cred, or PTR_ERR */
+-	tcred = auth->au_ops->lookup_cred(auth, acred, 0);
+-	if (IS_ERR(tcred))
+-		return -EACCES;
+-
+-	/* Test for the almost error case */
+-	ret = tcred->cr_ops->crkey_timeout(tcred);
+-	if (ret != 0) {
+-		set_bit(RPC_CRED_KEY_EXPIRE_SOON, &acred->ac_flags);
+-		ret = 0;
+-	} else {
+-		/* In case underlying cred key has been reset */
+-		if (test_and_clear_bit(RPC_CRED_KEY_EXPIRE_SOON,
+-					&acred->ac_flags))
+-			dprintk("RPC:        UID %d Credential key reset\n",
+-				from_kuid(&init_user_ns, tcred->cr_uid));
+-		/* set up fasttrack for the normal case */
+-		set_bit(RPC_CRED_NOTIFY_TIMEOUT, &acred->ac_flags);
+-	}
+-
+-	put_rpccred(tcred);
+-	return ret;
+-}
+-
+-static const struct rpc_authops generic_auth_ops = {
+-	.owner = THIS_MODULE,
+-	.au_name = "Generic",
+-	.hash_cred = generic_hash_cred,
+-	.lookup_cred = generic_lookup_cred,
+-	.crcreate = generic_create_cred,
+-	.key_timeout = generic_key_timeout,
+-};
+-
+-static struct rpc_auth generic_auth = {
+-	.au_ops = &generic_auth_ops,
+-	.au_count = ATOMIC_INIT(0),
+-};
+-
+-static bool generic_key_to_expire(struct rpc_cred *cred)
+-{
+-	struct auth_cred *acred = &container_of(cred, struct generic_cred,
+-						gc_base)->acred;
+-	bool ret;
+-
+-	get_rpccred(cred);
+-	ret = test_bit(RPC_CRED_KEY_EXPIRE_SOON, &acred->ac_flags);
+-	put_rpccred(cred);
+-
+-	return ret;
+-}
+-
+-static const struct rpc_credops generic_credops = {
+-	.cr_name = "Generic cred",
+-	.crdestroy = generic_destroy_cred,
+-	.crbind = generic_bind_cred,
+-	.crmatch = generic_match,
+-	.crkey_to_expire = generic_key_to_expire,
+-};
+diff --git a/bundle/net/sunrpc/svc.c b/bundle/net/sunrpc/svc.c
+index 55de92ae8..cb1692a41 100644
+--- a/bundle/net/sunrpc/svc.c
++++ b/bundle/net/sunrpc/svc.c
+@@ -31,6 +31,8 @@
+ 
+ #include <trace/events/sunrpc.h>
+ 
++#include "timer.h"
++
+ #define RPCDBG_FACILITY	RPCDBG_SVCDSP
+ 
+ static void svc_unregister(const struct svc_serv *serv, struct net *net);
+diff --git a/bundle/net/sunrpc/svc_xprt.c b/bundle/net/sunrpc/svc_xprt.c
+index 400630226..d0aad4441 100644
+--- a/bundle/net/sunrpc/svc_xprt.c
++++ b/bundle/net/sunrpc/svc_xprt.c
+@@ -21,6 +21,8 @@
+ #include <trace/events/sunrpc.h>
+ #include <linux/old-kernel.h>
+ 
++#include "timer.h"
++
+ #define RPCDBG_FACILITY	RPCDBG_SVCXPRT
+ 
+ static unsigned int svc_rpc_per_connection_limit __read_mostly;
+@@ -769,8 +771,7 @@ static void svc_add_new_temp_xprt(struct svc_serv *serv, struct svc_xprt *newxpt
+ 	serv->sv_tmpcnt++;
+ 	if (serv->sv_temptimer.function == NULL) {
+ 		/* setup timer to age temp transports */
+-		serv->sv_temptimer.function =
+-		    (void (*)(unsigned long))svc_age_temp_xprts;
++		timer_set_function(&serv->sv_temptimer, svc_age_temp_xprts);
+ 		mod_timer(&serv->sv_temptimer,
+ 			  jiffies + svc_conn_age_period * HZ);
+ 	}
+diff --git a/bundle/net/sunrpc/timer.h b/bundle/net/sunrpc/timer.h
+new file mode 100644
+index 000000000..c1cfe00e1
+--- /dev/null
++++ b/bundle/net/sunrpc/timer.h
+@@ -0,0 +1,19 @@
++#define TIMER_DATA_TYPE                unsigned long
++#define TIMER_FUNC_TYPE                void (*)(TIMER_DATA_TYPE)
++
++static inline void timer_setup(struct timer_list *timer,
++			       void (*callback)(struct timer_list *),
++			       unsigned int flags)
++{
++	__setup_timer(timer, (TIMER_FUNC_TYPE)callback,
++		      (TIMER_DATA_TYPE)timer, flags);
++}
++
++static inline void timer_set_function(struct timer_list *timer,
++				      void (*callback)(struct timer_list *))
++{
++	timer->function = (TIMER_FUNC_TYPE)callback;
++}
++
++#define from_timer(var, callback_timer, timer_fieldname) \
++	container_of(callback_timer, typeof(*var), timer_fieldname)
+diff --git a/bundle/net/sunrpc/wake_up_var.h b/bundle/net/sunrpc/wake_up_var.h
+new file mode 100644
+index 000000000..855d86fb5
+--- /dev/null
++++ b/bundle/net/sunrpc/wake_up_var.h
+@@ -0,0 +1,110 @@
++#define ___wait_var_event(var, condition, state, exclusive, ret, cmd)  \
++({                                                                     \
++       __label__ __out;                                                \
++       struct wait_queue_head *__wq_head = __var_waitqueue(var);       \
++       struct wait_bit_queue_entry __wbq_entry;                        \
++       long __ret = ret; /* explicit shadow */                         \
++                                                                       \
++       init_wait_var_entry(&__wbq_entry, var,                          \
++                           exclusive ? WQ_FLAG_EXCLUSIVE : 0);         \
++       for (;;) {                                                      \
++               long __int = prepare_to_wait_event(__wq_head,           \
++                                                  &__wbq_entry.wq_entry, \
++                                                  state);              \
++               if (condition)                                          \
++                       break;                                          \
++                                                                       \
++               if (___wait_is_interruptible(state) && __int) {         \
++                       __ret = __int;                                  \
++                       goto __out;                                     \
++               }                                                       \
++                                                                       \
++               cmd;                                                    \
++       }                                                               \
++       finish_wait(__wq_head, &__wbq_entry.wq_entry);                  \
++__out: __ret;                                                          \
++})
++
++#define __wait_var_event(var, condition)                               \
++       ___wait_var_event(var, condition, TASK_UNINTERRUPTIBLE, 0, 0,   \
++                         schedule())
++
++#define wait_var_event(var, condition)                                 \
++do {                                                                   \
++       might_sleep();                                                  \
++       if (condition)                                                  \
++               break;                                                  \
++       __wait_var_event(var, condition);                               \
++} while (0)
++
++#define __wait_var_event_killable(var, condition)                      \
++       ___wait_var_event(var, condition, TASK_KILLABLE, 0, 0,          \
++                         schedule())
++
++#define wait_var_event_killable(var, condition)                                \
++({                                                                     \
++       int __ret = 0;                                                  \
++       might_sleep();                                                  \
++       if (!(condition))                                               \
++               __ret = __wait_var_event_killable(var, condition);      \
++       __ret;                                                          \
++})
++
++#define __wait_var_event_timeout(var, condition, timeout)              \
++       ___wait_var_event(var, ___wait_cond_timeout(condition),         \
++                         TASK_UNINTERRUPTIBLE, 0, timeout,             \
++                         __ret = schedule_timeout(__ret))
++
++#define wait_var_event_timeout(var, condition, timeout)                        \
++({                                                                     \
++       long __ret = timeout;                                           \
++       might_sleep();                                                  \
++       if (!___wait_cond_timeout(condition))                           \
++               __ret = __wait_var_event_timeout(var, condition, timeout); \
++       __ret;                                                          \
++})
++
++static wait_queue_head_t *__var_waitqueue(void *p)
++{
++       if (BITS_PER_LONG == 64) {
++               unsigned long q = (unsigned long)p;
++
++               return bit_waitqueue((void *)(q & ~1), q & 1);
++       }
++       return bit_waitqueue(p, 0);
++}
++
++static int
++var_wake_function(struct wait_queue_entry *wq_entry, unsigned int mode,
++                 int sync, void *arg)
++{
++       struct wait_bit_key *key = arg;
++       struct wait_bit_queue_entry *wbq_entry =
++               container_of(wq_entry, struct wait_bit_queue_entry, wq_entry);
++
++       if (wbq_entry->key.flags != key->flags ||
++           wbq_entry->key.bit_nr != key->bit_nr)
++               return 0;
++
++       return autoremove_wake_function(wq_entry, mode, sync, key);
++}
++
++static void init_wait_var_entry(struct wait_bit_queue_entry *wbq_entry, void *var, int flags)
++{
++       *wbq_entry = (struct wait_bit_queue_entry){
++               .key = {
++                       .flags  = (var),
++                       .bit_nr = -1,
++               },
++               .wq_entry = {
++                       .private = current,
++                       .func    = var_wake_function,
++                       .entry   = LIST_HEAD_INIT(wbq_entry->wq_entry.entry),
++               },
++       };
++}
++
++static void wake_up_var(void *var)
++{
++       __wake_up_bit(__var_waitqueue(var), var, -1);
++}
+diff --git a/bundle/net/sunrpc/xprt.c b/bundle/net/sunrpc/xprt.c
+index ea51dc293..b9a69a020 100644
+--- a/bundle/net/sunrpc/xprt.c
++++ b/bundle/net/sunrpc/xprt.c
+@@ -820,6 +820,8 @@ xprt_schedule_autodisconnect(struct rpc_xprt *xprt)
+ 		mod_timer(&xprt->timer, xprt->last_used + xprt->idle_timeout);
+ }
+ 
++#include "timer.h"
++
+ static void
+ xprt_init_autodisconnect(struct timer_list *t)
+ {
+@@ -1046,6 +1048,8 @@ xprt_is_pinned_rqst(struct rpc_rqst *req)
+ 	return atomic_read(&req->rq_pin) != 0;
+ }
+ 
++#include "wake_up_var.h"
++
+ /**
+  * xprt_pin_rqst - Pin a request on the transport receive list
+  * @req: Request to pin
+diff --git a/bundle/net/sunrpc/xprtrdma/fmr_ops.c b/bundle/net/sunrpc/xprtrdma/fmr_ops.c
+deleted file mode 100644
+index da787e2fd..000000000
+--- a/bundle/net/sunrpc/xprtrdma/fmr_ops.c
++++ /dev/null
+@@ -1,347 +0,0 @@
+-/*
+- * Copyright (c) 2015, 2017 Oracle.  All rights reserved.
+- * Copyright (c) 2003-2007 Network Appliance, Inc. All rights reserved.
+- */
+-
+-/* Lightweight memory registration using Fast Memory Regions (FMR).
+- * Referred to sometimes as MTHCAFMR mode.
+- *
+- * FMR uses synchronous memory registration and deregistration.
+- * FMR registration is known to be fast, but FMR deregistration
+- * can take tens of usecs to complete.
+- */
+-
+-/* Normal operation
+- *
+- * A Memory Region is prepared for RDMA READ or WRITE using the
+- * ib_map_phys_fmr verb (fmr_op_map). When the RDMA operation is
+- * finished, the Memory Region is unmapped using the ib_unmap_fmr
+- * verb (fmr_op_unmap).
+- */
+-
+-#include <linux/sunrpc/svc_rdma.h>
+-
+-#include "xprt_rdma.h"
+-#include <trace/events/rpcrdma.h>
+-
+-#if IS_ENABLED(CONFIG_SUNRPC_DEBUG)
+-# define RPCDBG_FACILITY	RPCDBG_TRANS
+-#endif
+-
+-/* Maximum scatter/gather per FMR */
+-#define RPCRDMA_MAX_FMR_SGES	(64)
+-
+-/* Access mode of externally registered pages */
+-enum {
+-	RPCRDMA_FMR_ACCESS_FLAGS	= IB_ACCESS_REMOTE_WRITE |
+-					  IB_ACCESS_REMOTE_READ,
+-};
+-
+-bool
+-fmr_is_supported(struct rpcrdma_ia *ia)
+-{
+-	if (!ia->ri_device->alloc_fmr) {
+-		pr_info("rpcrdma: 'fmr' mode is not supported by device %s\n",
+-			ia->ri_device->name);
+-		return false;
+-	}
+-	return true;
+-}
+-
+-static int
+-fmr_op_init_mr(struct rpcrdma_ia *ia, struct rpcrdma_mr *mr)
+-{
+-	static struct ib_fmr_attr fmr_attr = {
+-		.max_pages	= RPCRDMA_MAX_FMR_SGES,
+-		.max_maps	= 1,
+-		.page_shift	= PAGE_SHIFT
+-	};
+-
+-	mr->fmr.fm_physaddrs = kcalloc(RPCRDMA_MAX_FMR_SGES,
+-				       sizeof(u64), GFP_KERNEL);
+-	if (!mr->fmr.fm_physaddrs)
+-		goto out_free;
+-
+-	mr->mr_sg = kcalloc(RPCRDMA_MAX_FMR_SGES,
+-			    sizeof(*mr->mr_sg), GFP_KERNEL);
+-	if (!mr->mr_sg)
+-		goto out_free;
+-
+-	sg_init_table(mr->mr_sg, RPCRDMA_MAX_FMR_SGES);
+-
+-	mr->fmr.fm_mr = ib_alloc_fmr(ia->ri_pd, RPCRDMA_FMR_ACCESS_FLAGS,
+-				     &fmr_attr);
+-	if (IS_ERR(mr->fmr.fm_mr))
+-		goto out_fmr_err;
+-
+-	INIT_LIST_HEAD(&mr->mr_list);
+-	return 0;
+-
+-out_fmr_err:
+-	dprintk("RPC:       %s: ib_alloc_fmr returned %ld\n", __func__,
+-		PTR_ERR(mr->fmr.fm_mr));
+-
+-out_free:
+-	kfree(mr->mr_sg);
+-	kfree(mr->fmr.fm_physaddrs);
+-	return -ENOMEM;
+-}
+-
+-static int
+-__fmr_unmap(struct rpcrdma_mr *mr)
+-{
+-	LIST_HEAD(l);
+-	int rc;
+-
+-	list_add(&mr->fmr.fm_mr->list, &l);
+-	rc = ib_unmap_fmr(&l);
+-	list_del(&mr->fmr.fm_mr->list);
+-	return rc;
+-}
+-
+-static void
+-fmr_op_release_mr(struct rpcrdma_mr *mr)
+-{
+-	LIST_HEAD(unmap_list);
+-	int rc;
+-
+-	kfree(mr->fmr.fm_physaddrs);
+-	kfree(mr->mr_sg);
+-
+-	/* In case this one was left mapped, try to unmap it
+-	 * to prevent dealloc_fmr from failing with EBUSY
+-	 */
+-	rc = __fmr_unmap(mr);
+-	if (rc)
+-		pr_err("rpcrdma: final ib_unmap_fmr for %p failed %i\n",
+-		       mr, rc);
+-
+-	rc = ib_dealloc_fmr(mr->fmr.fm_mr);
+-	if (rc)
+-		pr_err("rpcrdma: final ib_dealloc_fmr for %p returned %i\n",
+-		       mr, rc);
+-
+-	kfree(mr);
+-}
+-
+-/* Reset of a single FMR.
+- */
+-static void
+-fmr_op_recover_mr(struct rpcrdma_mr *mr)
+-{
+-	struct rpcrdma_xprt *r_xprt = mr->mr_xprt;
+-	int rc;
+-
+-	/* ORDER: invalidate first */
+-	rc = __fmr_unmap(mr);
+-	if (rc)
+-		goto out_release;
+-
+-	/* ORDER: then DMA unmap */
+-	rpcrdma_mr_unmap_and_put(mr);
+-
+-	r_xprt->rx_stats.mrs_recovered++;
+-	return;
+-
+-out_release:
+-	pr_err("rpcrdma: FMR reset failed (%d), %p released\n", rc, mr);
+-	r_xprt->rx_stats.mrs_orphaned++;
+-
+-	trace_xprtrdma_dma_unmap(mr);
+-	ib_dma_unmap_sg(r_xprt->rx_ia.ri_device,
+-			mr->mr_sg, mr->mr_nents, mr->mr_dir);
+-
+-	spin_lock(&r_xprt->rx_buf.rb_mrlock);
+-	list_del(&mr->mr_all);
+-	spin_unlock(&r_xprt->rx_buf.rb_mrlock);
+-
+-	fmr_op_release_mr(mr);
+-}
+-
+-/* On success, sets:
+- *	ep->rep_attr.cap.max_send_wr
+- *	ep->rep_attr.cap.max_recv_wr
+- *	cdata->max_requests
+- *	ia->ri_max_segs
+- */
+-static int
+-fmr_op_open(struct rpcrdma_ia *ia, struct rpcrdma_ep *ep,
+-	    struct rpcrdma_create_data_internal *cdata)
+-{
+-	int max_qp_wr;
+-
+-	max_qp_wr = ia->ri_device->attrs.max_qp_wr;
+-	max_qp_wr -= RPCRDMA_BACKWARD_WRS;
+-	max_qp_wr -= 1;
+-	if (max_qp_wr < RPCRDMA_MIN_SLOT_TABLE)
+-		return -ENOMEM;
+-	if (cdata->max_requests > max_qp_wr)
+-		cdata->max_requests = max_qp_wr;
+-	ep->rep_attr.cap.max_send_wr = cdata->max_requests;
+-	ep->rep_attr.cap.max_send_wr += RPCRDMA_BACKWARD_WRS;
+-	ep->rep_attr.cap.max_send_wr += 1; /* for ib_drain_sq */
+-	ep->rep_attr.cap.max_recv_wr = cdata->max_requests;
+-	ep->rep_attr.cap.max_recv_wr += RPCRDMA_BACKWARD_WRS;
+-	ep->rep_attr.cap.max_recv_wr += 1; /* for ib_drain_rq */
+-
+-	ia->ri_max_segs = max_t(unsigned int, 1, RPCRDMA_MAX_DATA_SEGS /
+-				RPCRDMA_MAX_FMR_SGES);
+-	return 0;
+-}
+-
+-/* FMR mode conveys up to 64 pages of payload per chunk segment.
+- */
+-static size_t
+-fmr_op_maxpages(struct rpcrdma_xprt *r_xprt)
+-{
+-	return min_t(unsigned int, RPCRDMA_MAX_DATA_SEGS,
+-		     RPCRDMA_MAX_HDR_SEGS * RPCRDMA_MAX_FMR_SGES);
+-}
+-
+-/* Use the ib_map_phys_fmr() verb to register a memory region
+- * for remote access via RDMA READ or RDMA WRITE.
+- */
+-static struct rpcrdma_mr_seg *
+-fmr_op_map(struct rpcrdma_xprt *r_xprt, struct rpcrdma_mr_seg *seg,
+-	   int nsegs, bool writing, struct rpcrdma_mr **out)
+-{
+-	struct rpcrdma_mr_seg *seg1 = seg;
+-	int len, pageoff, i, rc;
+-	struct rpcrdma_mr *mr;
+-	u64 *dma_pages;
+-
+-	mr = rpcrdma_mr_get(r_xprt);
+-	if (!mr)
+-		return ERR_PTR(-EAGAIN);
+-
+-	pageoff = offset_in_page(seg1->mr_offset);
+-	seg1->mr_offset -= pageoff;	/* start of page */
+-	seg1->mr_len += pageoff;
+-	len = -pageoff;
+-	if (nsegs > RPCRDMA_MAX_FMR_SGES)
+-		nsegs = RPCRDMA_MAX_FMR_SGES;
+-	for (i = 0; i < nsegs;) {
+-		if (seg->mr_page)
+-			sg_set_page(&mr->mr_sg[i],
+-				    seg->mr_page,
+-				    seg->mr_len,
+-				    offset_in_page(seg->mr_offset));
+-		else
+-			sg_set_buf(&mr->mr_sg[i], seg->mr_offset,
+-				   seg->mr_len);
+-		len += seg->mr_len;
+-		++seg;
+-		++i;
+-		/* Check for holes */
+-		if ((i < nsegs && offset_in_page(seg->mr_offset)) ||
+-		    offset_in_page((seg-1)->mr_offset + (seg-1)->mr_len))
+-			break;
+-	}
+-	mr->mr_dir = rpcrdma_data_dir(writing);
+-
+-	mr->mr_nents = ib_dma_map_sg(r_xprt->rx_ia.ri_device,
+-				     mr->mr_sg, i, mr->mr_dir);
+-	if (!mr->mr_nents)
+-		goto out_dmamap_err;
+-	trace_xprtrdma_dma_map(mr);
+-
+-	for (i = 0, dma_pages = mr->fmr.fm_physaddrs; i < mr->mr_nents; i++)
+-		dma_pages[i] = sg_dma_address(&mr->mr_sg[i]);
+-	rc = ib_map_phys_fmr(mr->fmr.fm_mr, dma_pages, mr->mr_nents,
+-			     dma_pages[0]);
+-	if (rc)
+-		goto out_maperr;
+-
+-	mr->mr_handle = mr->fmr.fm_mr->rkey;
+-	mr->mr_length = len;
+-	mr->mr_offset = dma_pages[0] + pageoff;
+-
+-	*out = mr;
+-	return seg;
+-
+-out_dmamap_err:
+-	pr_err("rpcrdma: failed to DMA map sg %p sg_nents %d\n",
+-	       mr->mr_sg, i);
+-	rpcrdma_mr_put(mr);
+-	return ERR_PTR(-EIO);
+-
+-out_maperr:
+-	pr_err("rpcrdma: ib_map_phys_fmr %u@0x%llx+%i (%d) status %i\n",
+-	       len, (unsigned long long)dma_pages[0],
+-	       pageoff, mr->mr_nents, rc);
+-	rpcrdma_mr_unmap_and_put(mr);
+-	return ERR_PTR(-EIO);
+-}
+-
+-/* Post Send WR containing the RPC Call message.
+- */
+-static int
+-fmr_op_send(struct rpcrdma_ia *ia, struct rpcrdma_req *req)
+-{
+-	return ib_post_send(ia->ri_id->qp, &req->rl_sendctx->sc_wr, NULL);
+-}
+-
+-/* Invalidate all memory regions that were registered for "req".
+- *
+- * Sleeps until it is safe for the host CPU to access the
+- * previously mapped memory regions.
+- *
+- * Caller ensures that @mrs is not empty before the call. This
+- * function empties the list.
+- */
+-static void
+-fmr_op_unmap_sync(struct rpcrdma_xprt *r_xprt, struct list_head *mrs)
+-{
+-	struct rpcrdma_mr *mr;
+-	LIST_HEAD(unmap_list);
+-	int rc;
+-
+-	/* ORDER: Invalidate all of the req's MRs first
+-	 *
+-	 * ib_unmap_fmr() is slow, so use a single call instead
+-	 * of one call per mapped FMR.
+-	 */
+-	list_for_each_entry(mr, mrs, mr_list) {
+-		dprintk("RPC:       %s: unmapping fmr %p\n",
+-			__func__, &mr->fmr);
+-		trace_xprtrdma_localinv(mr);
+-		list_add_tail(&mr->fmr.fm_mr->list, &unmap_list);
+-	}
+-	r_xprt->rx_stats.local_inv_needed++;
+-	rc = ib_unmap_fmr(&unmap_list);
+-	if (rc)
+-		goto out_reset;
+-
+-	/* ORDER: Now DMA unmap all of the req's MRs, and return
+-	 * them to the free MW list.
+-	 */
+-	while (!list_empty(mrs)) {
+-		mr = rpcrdma_mr_pop(mrs);
+-		list_del(&mr->fmr.fm_mr->list);
+-		rpcrdma_mr_unmap_and_put(mr);
+-	}
+-
+-	return;
+-
+-out_reset:
+-	pr_err("rpcrdma: ib_unmap_fmr failed (%i)\n", rc);
+-
+-	while (!list_empty(mrs)) {
+-		mr = rpcrdma_mr_pop(mrs);
+-		list_del(&mr->fmr.fm_mr->list);
+-		fmr_op_recover_mr(mr);
+-	}
+-}
+-
+-const struct rpcrdma_memreg_ops rpcrdma_fmr_memreg_ops = {
+-	.ro_map				= fmr_op_map,
+-	.ro_send			= fmr_op_send,
+-	.ro_unmap_sync			= fmr_op_unmap_sync,
+-	.ro_recover_mr			= fmr_op_recover_mr,
+-	.ro_open			= fmr_op_open,
+-	.ro_maxpages			= fmr_op_maxpages,
+-	.ro_init_mr			= fmr_op_init_mr,
+-	.ro_release_mr			= fmr_op_release_mr,
+-	.ro_displayname			= "fmr",
+-	.ro_send_w_inv_ok		= 0,
+-};
+diff --git a/bundle/net/sunrpc/xprtrdma/overflow.h b/bundle/net/sunrpc/xprtrdma/overflow.h
+new file mode 100644
+index 000000000..8c6e4548d
+--- /dev/null
++++ b/bundle/net/sunrpc/xprtrdma/overflow.h
+@@ -0,0 +1,324 @@
++/* SPDX-License-Identifier: GPL-2.0 OR MIT */
++#ifndef __LINUX_OVERFLOW_H
++#define __LINUX_OVERFLOW_H
++
++#include <linux/compiler.h>
++#include <linux/types.h>
++
++#ifndef SIZE_MAX
++#define SIZE_MAX    (~(size_t)0)
++#endif
++
++/*
++ * In the fallback code below, we need to compute the minimum and
++ * maximum values representable in a given type. These macros may also
++ * be useful elsewhere, so we provide them outside the
++ * COMPILER_HAS_GENERIC_BUILTIN_OVERFLOW block.
++ *
++ * It would seem more obvious to do something like
++ *
++ * #define type_min(T) (T)(is_signed_type(T) ? (T)1 << (8*sizeof(T)-1) : 0)
++ * #define type_max(T) (T)(is_signed_type(T) ? ((T)1 << (8*sizeof(T)-1)) - 1 : ~(T)0)
++ *
++ * Unfortunately, the middle expressions, strictly speaking, have
++ * undefined behaviour, and at least some versions of gcc warn about
++ * the type_max expression (but not if -fsanitize=undefined is in
++ * effect; in that case, the warning is deferred to runtime...).
++ *
++ * The slightly excessive casting in type_min is to make sure the
++ * macros also produce sensible values for the exotic type _Bool. [The
++ * overflow checkers only almost work for _Bool, but that's
++ * a-feature-not-a-bug, since people shouldn't be doing arithmetic on
++ * _Bools. Besides, the gcc builtins don't allow _Bool* as third
++ * argument.]
++ *
++ * Idea stolen from
++ * https://mail-index.netbsd.org/tech-misc/2007/02/05/0000.html -
++ * credit to Christian Biere.
++ */
++#define is_signed_type(type)       (((type)(-1)) < (type)1)
++#define __type_half_max(type) ((type)1 << (8*sizeof(type) - 1 - is_signed_type(type)))
++#define type_max(T) ((T)((__type_half_max(T) - 1) + __type_half_max(T)))
++#define type_min(T) ((T)((T)-type_max(T)-(T)1))
++
++/*
++ * Avoids triggering -Wtype-limits compilation warning,
++ * while using unsigned data types to check a < 0.
++ */
++#define is_non_negative(a) ((a) > 0 || (a) == 0)
++#define is_negative(a) (!(is_non_negative(a)))
++
++#ifdef COMPILER_HAS_GENERIC_BUILTIN_OVERFLOW
++/*
++ * For simplicity and code hygiene, the fallback code below insists on
++ * a, b and *d having the same type (similar to the min() and max()
++ * macros), whereas gcc's type-generic overflow checkers accept
++ * different types. Hence we don't just make check_add_overflow an
++ * alias for __builtin_add_overflow, but add type checks similar to
++ * below.
++ */
++#define check_add_overflow(a, b, d) ({		\
++	typeof(a) __a = (a);			\
++	typeof(b) __b = (b);			\
++	typeof(d) __d = (d);			\
++	(void) (&__a == &__b);			\
++	(void) (&__a == __d);			\
++	__builtin_add_overflow(__a, __b, __d);	\
++})
++
++#define check_sub_overflow(a, b, d) ({		\
++	typeof(a) __a = (a);			\
++	typeof(b) __b = (b);			\
++	typeof(d) __d = (d);			\
++	(void) (&__a == &__b);			\
++	(void) (&__a == __d);			\
++	__builtin_sub_overflow(__a, __b, __d);	\
++})
++
++#define check_mul_overflow(a, b, d) ({		\
++	typeof(a) __a = (a);			\
++	typeof(b) __b = (b);			\
++	typeof(d) __d = (d);			\
++	(void) (&__a == &__b);			\
++	(void) (&__a == __d);			\
++	__builtin_mul_overflow(__a, __b, __d);	\
++})
++
++#else
++
++
++/* Checking for unsigned overflow is relatively easy without causing UB. */
++#define __unsigned_add_overflow(a, b, d) ({	\
++	typeof(a) __a = (a);			\
++	typeof(b) __b = (b);			\
++	typeof(d) __d = (d);			\
++	(void) (&__a == &__b);			\
++	(void) (&__a == __d);			\
++	*__d = __a + __b;			\
++	*__d < __a;				\
++})
++#define __unsigned_sub_overflow(a, b, d) ({	\
++	typeof(a) __a = (a);			\
++	typeof(b) __b = (b);			\
++	typeof(d) __d = (d);			\
++	(void) (&__a == &__b);			\
++	(void) (&__a == __d);			\
++	*__d = __a - __b;			\
++	__a < __b;				\
++})
++/*
++ * If one of a or b is a compile-time constant, this avoids a division.
++ */
++#define __unsigned_mul_overflow(a, b, d) ({		\
++	typeof(a) __a = (a);				\
++	typeof(b) __b = (b);				\
++	typeof(d) __d = (d);				\
++	(void) (&__a == &__b);				\
++	(void) (&__a == __d);				\
++	*__d = __a * __b;				\
++	__builtin_constant_p(__b) ?			\
++	  __b > 0 && __a > type_max(typeof(__a)) / __b : \
++	  __a > 0 && __b > type_max(typeof(__b)) / __a;	 \
++})
++
++/*
++ * For signed types, detecting overflow is much harder, especially if
++ * we want to avoid UB. But the interface of these macros is such that
++ * we must provide a result in *d, and in fact we must produce the
++ * result promised by gcc's builtins, which is simply the possibly
++ * wrapped-around value. Fortunately, we can just formally do the
++ * operations in the widest relevant unsigned type (u64) and then
++ * truncate the result - gcc is smart enough to generate the same code
++ * with and without the (u64) casts.
++ */
++
++/*
++ * Adding two signed integers can overflow only if they have the same
++ * sign, and overflow has happened iff the result has the opposite
++ * sign.
++ */
++#define __signed_add_overflow(a, b, d) ({	\
++	typeof(a) __a = (a);			\
++	typeof(b) __b = (b);			\
++	typeof(d) __d = (d);			\
++	(void) (&__a == &__b);			\
++	(void) (&__a == __d);			\
++	*__d = (u64)__a + (u64)__b;		\
++	(((~(__a ^ __b)) & (*__d ^ __a))	\
++		& type_min(typeof(__a))) != 0;	\
++})
++
++/*
++ * Subtraction is similar, except that overflow can now happen only
++ * when the signs are opposite. In this case, overflow has happened if
++ * the result has the opposite sign of a.
++ */
++#define __signed_sub_overflow(a, b, d) ({	\
++	typeof(a) __a = (a);			\
++	typeof(b) __b = (b);			\
++	typeof(d) __d = (d);			\
++	(void) (&__a == &__b);			\
++	(void) (&__a == __d);			\
++	*__d = (u64)__a - (u64)__b;		\
++	((((__a ^ __b)) & (*__d ^ __a))		\
++		& type_min(typeof(__a))) != 0;	\
++})
++
++/*
++ * Signed multiplication is rather hard. gcc always follows C99, so
++ * division is truncated towards 0. This means that we can write the
++ * overflow check like this:
++ *
++ * (a > 0 && (b > MAX/a || b < MIN/a)) ||
++ * (a < -1 && (b > MIN/a || b < MAX/a) ||
++ * (a == -1 && b == MIN)
++ *
++ * The redundant casts of -1 are to silence an annoying -Wtype-limits
++ * (included in -Wextra) warning: When the type is u8 or u16, the
++ * __b_c_e in check_mul_overflow obviously selects
++ * __unsigned_mul_overflow, but unfortunately gcc still parses this
++ * code and warns about the limited range of __b.
++ */
++
++#define __signed_mul_overflow(a, b, d) ({				\
++	typeof(a) __a = (a);						\
++	typeof(b) __b = (b);						\
++	typeof(d) __d = (d);						\
++	typeof(a) __tmax = type_max(typeof(a));				\
++	typeof(a) __tmin = type_min(typeof(a));				\
++	(void) (&__a == &__b);						\
++	(void) (&__a == __d);						\
++	*__d = (u64)__a * (u64)__b;					\
++	(__b > 0   && (__a > __tmax/__b || __a < __tmin/__b)) ||	\
++	(__b < (typeof(__b))-1  && (__a > __tmin/__b || __a < __tmax/__b)) || \
++	(__b == (typeof(__b))-1 && __a == __tmin);			\
++})
++
++
++#define check_add_overflow(a, b, d)					\
++	__builtin_choose_expr(is_signed_type(typeof(a)),		\
++			__signed_add_overflow(a, b, d),			\
++			__unsigned_add_overflow(a, b, d))
++
++#define check_sub_overflow(a, b, d)					\
++	__builtin_choose_expr(is_signed_type(typeof(a)),		\
++			__signed_sub_overflow(a, b, d),			\
++			__unsigned_sub_overflow(a, b, d))
++
++#define check_mul_overflow(a, b, d)					\
++	__builtin_choose_expr(is_signed_type(typeof(a)),		\
++			__signed_mul_overflow(a, b, d),			\
++			__unsigned_mul_overflow(a, b, d))
++
++
++#endif /* COMPILER_HAS_GENERIC_BUILTIN_OVERFLOW */
++
++/** check_shl_overflow() - Calculate a left-shifted value and check overflow
++ *
++ * @a: Value to be shifted
++ * @s: How many bits left to shift
++ * @d: Pointer to where to store the result
++ *
++ * Computes *@d = (@a << @s)
++ *
++ * Returns true if '*d' cannot hold the result or when 'a << s' doesn't
++ * make sense. Example conditions:
++ * - 'a << s' causes bits to be lost when stored in *d.
++ * - 's' is garbage (e.g. negative) or so large that the result of
++ *   'a << s' is guaranteed to be 0.
++ * - 'a' is negative.
++ * - 'a << s' sets the sign bit, if any, in '*d'.
++ *
++ * '*d' will hold the results of the attempted shift, but is not
++ * considered "safe for use" if false is returned.
++ */
++#define check_shl_overflow(a, s, d) ({					\
++	typeof(a) _a = a;						\
++	typeof(s) _s = s;						\
++	typeof(d) _d = d;						\
++	u64 _a_full = _a;						\
++	unsigned int _to_shift =					\
++		is_non_negative(_s) && _s < 8 * sizeof(*d) ? _s : 0;	\
++	*_d = (_a_full << _to_shift);					\
++	(_to_shift != _s || is_negative(*_d) || is_negative(_a) ||	\
++	(*_d >> _to_shift) != _a);					\
++})
++
++/**
++ * array_size() - Calculate size of 2-dimensional array.
++ *
++ * @a: dimension one
++ * @b: dimension two
++ *
++ * Calculates size of 2-dimensional array: @a * @b.
++ *
++ * Returns: number of bytes needed to represent the array or SIZE_MAX on
++ * overflow.
++ */
++static inline __must_check size_t array_size(size_t a, size_t b)
++{
++	size_t bytes;
++
++	if (check_mul_overflow(a, b, &bytes))
++		return SIZE_MAX;
++
++	return bytes;
++}
++
++/**
++ * array3_size() - Calculate size of 3-dimensional array.
++ *
++ * @a: dimension one
++ * @b: dimension two
++ * @c: dimension three
++ *
++ * Calculates size of 3-dimensional array: @a * @b * @c.
++ *
++ * Returns: number of bytes needed to represent the array or SIZE_MAX on
++ * overflow.
++ */
++static inline __must_check size_t array3_size(size_t a, size_t b, size_t c)
++{
++	size_t bytes;
++
++	if (check_mul_overflow(a, b, &bytes))
++		return SIZE_MAX;
++	if (check_mul_overflow(bytes, c, &bytes))
++		return SIZE_MAX;
++
++	return bytes;
++}
++
++/*
++ * Compute a*b+c, returning SIZE_MAX on overflow. Internal helper for
++ * struct_size() below.
++ */
++static inline __must_check size_t __ab_c_size(size_t a, size_t b, size_t c)
++{
++	size_t bytes;
++
++	if (check_mul_overflow(a, b, &bytes))
++		return SIZE_MAX;
++	if (check_add_overflow(bytes, c, &bytes))
++		return SIZE_MAX;
++
++	return bytes;
++}
++
++/**
++ * struct_size() - Calculate size of structure with trailing array.
++ * @p: Pointer to the structure.
++ * @member: Name of the array member.
++ * @n: Number of elements in the array.
++ *
++ * Calculates size of memory needed for structure @p followed by an
++ * array of @n @member elements.
++ *
++ * Return: number of bytes needed or SIZE_MAX on overflow.
++ */
++#define struct_size(p, member, n)					\
++	__ab_c_size(n,							\
++		    sizeof(*(p)->member) + __must_be_array((p)->member),\
++		    sizeof(*(p)))
++
++#endif /* __LINUX_OVERFLOW_H */
+diff --git a/bundle/net/sunrpc/xprtrdma/svc_rdma_rw.c b/bundle/net/sunrpc/xprtrdma/svc_rdma_rw.c
+index 53573e2d8..0e3aa53ad 100644
+--- a/bundle/net/sunrpc/xprtrdma/svc_rdma_rw.c
++++ b/bundle/net/sunrpc/xprtrdma/svc_rdma_rw.c
+@@ -5,6 +5,8 @@
+  * Use the core R/W API to move RPC-over-RDMA Read and Write chunks.
+  */
+ 
++#include "overflow.h"
++
+ #include <rdma/rw.h>
+ 
+ #include <linux/sunrpc/rpc_rdma.h>
+@@ -71,8 +73,7 @@ svc_rdma_get_rw_ctxt(struct svcxprt_rdma *rdma, unsigned int sges)
+ 
+ 	ctxt->rw_sg_table.sgl = ctxt->rw_first_sgl;
+ 	if (sg_alloc_table_chained(&ctxt->rw_sg_table, sges,
+-				   ctxt->rw_sg_table.sgl,
+-				   SG_CHUNK_SIZE))
++				   ctxt->rw_sg_table.sgl))
+ 		goto out_free;
+ 	return ctxt;
+ 
+diff --git a/bundle/net/sunrpc/xprtrdma/verbs.c b/bundle/net/sunrpc/xprtrdma/verbs.c
+index e47c4167e..16a379fc2 100644
+--- a/bundle/net/sunrpc/xprtrdma/verbs.c
++++ b/bundle/net/sunrpc/xprtrdma/verbs.c
+@@ -49,6 +49,9 @@
+  *  o buffer memory
+  */
+ 
++#include "overflow.h"
++
++#include <linux/module.h>
+ #include <linux/interrupt.h>
+ #include <linux/slab.h>
+ #include <linux/sunrpc/addr.h>
+diff --git a/bundle/net/sunrpc/xprtsock.c b/bundle/net/sunrpc/xprtsock.c
+index ffdf5bf76..5c7c09c9f 100644
+--- a/bundle/net/sunrpc/xprtsock.c
++++ b/bundle/net/sunrpc/xprtsock.c
+@@ -792,7 +792,7 @@ static int xs_nospace(struct rpc_rqst *req)
+ 
+ 		rcu_read_lock();
+ 		wq = rcu_dereference(sk->sk_wq);
+-		set_bit(SOCK_ASYNC_NOSPACE, &sk->sk_socket->flags);
++		set_bit(SOCKWQ_ASYNC_NOSPACE, &wq->flags);
+ 		rcu_read_unlock();
+ 
+ 		sk->sk_write_space(sk);
+@@ -1484,7 +1484,7 @@ static void xs_write_space(struct sock *sk)
+ 	transport = container_of(xprt, struct sock_xprt, xprt);
+ 	rcu_read_lock();
+ 	wq = rcu_dereference(sk->sk_wq);
+-	if (!wq || test_and_clear_bit(SOCK_ASYNC_NOSPACE, &sk->sk_socket->flags) == 0)
++	if (!wq || test_and_clear_bit(SOCKWQ_ASYNC_NOSPACE, &wq->flags) == 0)
+ 		goto out;
+ 
+ 	xs_run_error_worker(transport, XPRT_SOCK_WAKE_WRITE);
+diff --git a/makefile b/makefile
+index ec3f694d5..0b90fd2d7 100755
+--- a/makefile
++++ b/makefile
+@@ -75,8 +75,8 @@ else
+ CONFIG_NVSTUB=
+ endif
+ 
+-autoconf_h=$(shell /bin/ls -1 $(K_OBJ)/include/*/autoconf.h 2> /dev/null | head -1)
+-kconfig_h=$(shell /bin/ls -1 $(K_SRC)/include/*/kconfig.h 2> /dev/null | head -1)
++autoconf_h=$(shell /bin/ls -1 $(K_BUILD)/include/*/autoconf.h 2> /dev/null | head -1)
++kconfig_h=$(shell /bin/ls -1 $(K_BUILD)/include/*/kconfig.h 2> /dev/null | head -1)
+ 
+ ifneq ($(kconfig_h),)
+ KCONFIG_H = -include $(kconfig_h)

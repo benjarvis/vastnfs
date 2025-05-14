@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0
+
+define XDR_TRACE_CLASS
+$$(obj)/$2: $$(obj)/$3
+$$(obj)/$3: $$(src)/$4/include/trace/events/sunrpc_prog_classes.h FORCE
+	@echo " GEN      $$@"
+	@rm -f $$@; cat $$< \
+		| sed s/%TRACE_SUNRPC_PROG_ENCODE_CLASS_NAME%/$1_encode_class/g \
+		| sed s/%TRACE_SUNRPC_PROG_DECODE_CLASS_NAME%/$1_decode_class/g \
+		| sed s/%DEFINE_PROG_EVENT%/DEFINE_$1_PROG_EVENT/g \
+		> $$@
+	@chmod u-w $$@
+
+targets += $3
+ccflags-y := -I$$(obj)
+endef

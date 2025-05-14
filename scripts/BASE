@@ -1,0 +1,56 @@
+v5.15.15
+
+# Synced up to v5.15.147, expect some exceptions:
+
+skipped-commit 54f6834b283d9b4d070b0639d9ef5e1d156fe7b0
+# SUNRPC: Ensure we flush any closed sockets before xs_xprt_free()
+#
+# skipped due to unexported __fput_sync
+
+skipped-commit 281c6a47416bd9d07cf9a4f6a7861bbdca78a360
+# NFSv4: Fix races in the legacy idmapper upcall
+#
+# too many conflicts
+
+skipped-commit 63e921d4edb3adc9e64ed4879ca41a5bda3d4e32
+# sunrpc: fix expiry of auth creds
+#
+# already applied
+#
+
+skipped-commit a472f069ced8601979f53c13c0cf20236074ed46
+# nfsd: under NFSv4.1, fix double svc_xprt_put on rpc_create failure
+# already applied
+
+skipped-commit ccbf841c73ef9959f2307a22e3b9260ea218d913
+# NFSv4: keep state manager thread active if swap is enabled
+
+skipped-commit 91758289faad6bde52710b2114dcb3f658f9a50e
+# NFS: fix disabling of swap
+#
+# Over usage of newer API wait_var_event_interruptible, these two are skipped
+
+skipped-commit 9712097e89b2672ef8b821bfbe85c3c2bb5c2bc4
+# SUNRPC: Clean up svc_deferred_class trace events
+#
+# Over the usage of __sockaddr
+#
+
+skipped-commit 01966511868ee8238cd732f1f97ebffd0c6eb98a
+# nfs: use vfs setgid helper
+#
+# Will be added back with Linux 6.6 support
+
+skipped-commit 2d8ae8c417db284f598dffb178cc01e7db0f1821
+# nfsd: use vfs setgid helper
+#
+# Will be added back with Linux 6.6 support
+
+skipped-commit f8b0b6a8e196bbcce9b22569c9821f65b3013e57
+# NFS: Cleanup unused rpc_clnt variable
+# Not needed because ccbf841c73ef9959f2307a not applied
+
+skipped-commit 65a218ca516efa464d435f0e35a1fb5bb9a74082
+# NFSv4: Fix a state manager thread deadlock regression
+#
+# Also relied on swap changes.

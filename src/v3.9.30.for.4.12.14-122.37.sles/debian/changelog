@@ -1,0 +1,5 @@
+mlnx-nfsrdma (4.5-OFED.4.5.1.0.1.1.gb4fdfac.multikernel.vastdata) unstable; urgency=low
+
+  * Initial release.
+
+ -- Alaa Hleihel <alaa@mellanox.com>  Mon, 15 Aug 2016 13:30:53 +0200

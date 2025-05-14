@@ -1,0 +1,30 @@
+#!/bin/bash
+
+set -e
+
+if [[ "${VASTNFS_DEPMOD_RUN:-}" == "n" ]] ; then
+    echo "Skipping depmod run"
+    exit 0
+fi
+
+echo "Running depmod"
+
+kernel=$(cat /usr/share/vastnfs/build-info.txt | grep Kernel: | awk '{print $2}')
+
+if [[ "${kernel}" == "" ]] ; then
+    echo "prerm: kernel not found"
+    exit -1
+fi
+
+echo "Built for kernel ${kernel}"
+
+moddir=/lib/modules/${kernel}/updates/bundle
+
+if [[ ! -d ${moddir} ]] ; then
+    echo "prerm: ${moddir} not found"
+    exit -1
+fi
+
+# Restore the original depmod after the modules were removed
+rm -rf ${moddir}
+/sbin/depmod ${kernel}
